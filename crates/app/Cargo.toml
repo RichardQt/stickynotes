@@ -1,0 +1,15 @@
+[package]
+name = "stickynotes-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "stickynotes"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit.workspace = true
+markdown-editor.workspace = true
+stickynotes-core.workspace = true
+uuid.workspace = true
+anyhow.workspace = true

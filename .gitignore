@@ -1,0 +1,14 @@
+# Build output
+/target/
+/stickynotes.exe
+
+# Local note-database backups (personal data — never publish)
+/backups/
+
+# Scratch logs and UI-automation dumps
+*.log
+uia_*.txt
+
+# Screenshots and compiled helper binaries (capture note contents)
+*.png
+*.exe

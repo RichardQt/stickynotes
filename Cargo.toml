@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app", "crates/vendor/markdown-editor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+gpui-kit = "0.10.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+thiserror = "2"
+anyhow = "1"
+
+stickynotes-core = { path = "crates/core" }
+markdown-editor = { path = "crates/vendor/markdown-editor", package = "gpui-kit-markdown-editor" }
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
