@@ -2,8 +2,12 @@
 
 pub mod backup;
 pub mod model;
+pub mod shadow;
+
+pub use shadow::MarkdownStore;
 
 use crate::ticks;
+use base64::Engine as _;
 use model::NoteSummary;
 use rusqlite::{params, Connection, OpenFlags};
 use std::path::{Path, PathBuf};
@@ -109,27 +113,77 @@ impl PlumStore {
         Ok(rows.next().transpose()?)
     }
 
-    /// Update an existing note's text. Caller must ensure the app is not running.
-    pub fn update_text(&self, id: &str, plum_text: &str) -> Result<()> {
+    /// Update an existing note's text, returning the `UpdatedAt` value written.
+    pub fn update_text(&self, id: &str, plum_text: &str) -> Result<i64> {
         backup::backup_if_needed(&self.path)?;
         let conn = self.conn_write()?;
-        conn.execute(
+        let updated_at = ticks::now_ticks();
+        let changed = conn.execute(
             "UPDATE Note SET Text = ?1, UpdatedAt = ?2 WHERE Id = ?3",
-            params![plum_text, ticks::now_ticks(), id],
+            params![plum_text, updated_at, id],
         )?;
-        Ok(())
+        if changed == 0 {
+            return Err(PlumError::Other(format!("note {id} not found")));
+        }
+        Ok(updated_at)
+    }
+
+    /// The native app's `ChangeKey` is a 30-byte blob: a 4-byte type tag, a
+    /// 4-byte length, the 16-byte collection GUID, then a 6-byte per-note
+    /// version token (`00`, a small epoch byte, then 4 varying bytes).
+    ///
+    /// A new note must mint its **own** token. Cloning a template's key makes
+    /// the cloud service treat separate notes as versions of one item — we
+    /// saw three inserted notes and a live note all sharing one key.
+    fn fresh_change_key(template: Option<&str>) -> Option<String> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(template?)
+            .ok()?;
+        if bytes.len() != 30 {
+            return None;
+        }
+        let mut fresh = bytes;
+        // Keep the header, collection GUID and epoch byte; only the trailing
+        // four bytes are per-note.
+        fresh[26..30].copy_from_slice(&uuid::Uuid::new_v4().into_bytes()[..4]);
+        Some(base64::engine::general_purpose::STANDARD.encode(fresh))
     }
 
     /// Insert a new note by cloning field values from an existing healthy row.
     pub fn insert_note(&self, plum_text: &str, theme: &str) -> Result<String> {
+        self.insert_note_full(None, plum_text, theme, None)
+    }
+
+    /// Insert a note with a caller-chosen id and timestamp (WebDAV import keeps
+    /// the id from the remote file, so devices agree on the filename).
+    pub fn insert_note_with_id(
+        &self,
+        id: &str,
+        plum_text: &str,
+        theme: &str,
+        updated_at: i64,
+    ) -> Result<String> {
+        self.insert_note_full(Some(id), plum_text, theme, Some(updated_at))
+    }
+
+    fn insert_note_full(
+        &self,
+        id: Option<&str>,
+        plum_text: &str,
+        theme: &str,
+        updated_at: Option<i64>,
+    ) -> Result<String> {
         backup::backup_if_needed(&self.path)?;
         let conn = self.conn_write()?;
-        let new_id = uuid::Uuid::new_v4().to_string();
-        let now = ticks::now_ticks();
+        let new_id = id
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let now = updated_at.unwrap_or_else(ticks::now_ticks);
 
-        // Clone all fields from an existing healthy row (Type/ParentId/ChangeKey semantics
-        // are undocumented; copying a known-good row maximizes the chance the UWP app
-        // accepts and syncs the new note).
+        // Clone the opaque fields from an existing healthy row (Type/ParentId
+        // semantics are undocumented; copying a known-good row maximizes the
+        // chance the UWP app accepts the new note) — except ChangeKey, which
+        // must be unique per note and is minted below.
         let mut stmt = conn.prepare(
             "SELECT WindowPosition, IsAlwaysOnTop, CreationNoteIdAnchor, IsFutureNote, \
              ChangeKey, RemoteSchemaVersion, IsRemoteDataInvalid, PendingInsightsScan, Type, ParentId \
@@ -145,6 +199,7 @@ impl PlumStore {
             .ok();
         let (window_pos, always_on_top, anchor, future, change_key, schema_ver, remote_invalid, _, ty, parent) =
             template.unwrap_or((None, 0, None, 0, None, 0, 0, 0, None, None));
+        let change_key = Self::fresh_change_key(change_key.as_deref());
 
         conn.execute(
             "INSERT INTO Note (Text, WindowPosition, IsOpen, IsAlwaysOnTop, CreationNoteIdAnchor, \
@@ -313,4 +368,39 @@ pub fn extract_title_and_snippet(plum_text: &str) -> (String, String) {
     };
 
     (title_str, snippet_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic ChangeKey shape (header + collection GUID + per-note tail).
+    /// Deliberately fake bytes: never copy a key from a real plum database.
+    const TEMPLATE: &str = "CQAAFh4AAAAAESIzRFVmd4iZqrvM3e7/AAECAwQF";
+
+    fn decode(s: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    #[test]
+    fn fresh_change_key_keeps_header_and_mints_unique_tails() {
+        let a = PlumStore::fresh_change_key(Some(TEMPLATE)).expect("template decodes");
+        let b = PlumStore::fresh_change_key(Some(TEMPLATE)).expect("template decodes");
+
+        assert_eq!(a.len(), TEMPLATE.len());
+        assert_ne!(a, b, "two notes must never share a ChangeKey");
+        assert_ne!(a, TEMPLATE);
+
+        let (a_bytes, template_bytes) = (decode(&a), decode(TEMPLATE));
+        assert_eq!(a_bytes.len(), 30);
+        assert_eq!(&a_bytes[..26], &template_bytes[..26], "header + GUID + epoch kept");
+    }
+
+    #[test]
+    fn fresh_change_key_rejects_missing_or_malformed_templates() {
+        assert!(PlumStore::fresh_change_key(None).is_none());
+        assert!(PlumStore::fresh_change_key(Some("not base64!")).is_none());
+        // "COOKIE" decodes fine but is not a 30-byte ChangeKey.
+        assert!(PlumStore::fresh_change_key(Some("Q09PS0lF")).is_none());
+    }
 }

@@ -4,6 +4,36 @@ mod ui;
 use gpui_kit::*;
 
 fn main() {
+    // Desktop panics otherwise vanish with the window; keep a one-line trace
+    // in `%LOCALAPPDATA%\stickynotes\panic.log` (never note content).
+    std::panic::set_hook(Box::new(|info| {
+        let mut text = String::from("PANIC ");
+        if let Some(loc) = info.location() {
+            text.push_str(&format!("{}:{} ", loc.file(), loc.line()));
+        }
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string payload>".into()
+        };
+        text.push_str(&msg);
+        eprintln!("{text}");
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let dir = std::path::Path::new(&local).join("stickynotes");
+            let _ = std::fs::create_dir_all(&dir);
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+            {
+                let _ = writeln!(f, "{text}");
+            }
+        }
+    }));
+
     // Register the bundled Lucide icon set. Without an AssetSource every
     // `IconName` (window controls, search, pin, tag icons…) resolves to a
     // missing path and renders as nothing. `AllAssets` embeds the complete

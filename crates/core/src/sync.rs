@@ -1,7 +1,7 @@
 //! Sync coordinator: orchestrates reads/writes and launching the built-in
 //! Sticky Notes app (which performs the actual cloud sync via Microsoft account).
 
-use crate::store::{PlumError, PlumStore, Result};
+use crate::store::{MarkdownStore, PlumError, PlumStore, Result};
 use std::path::Path;
 use std::process::Command;
 
@@ -73,27 +73,65 @@ pub fn wait_until_synced(plum: &PlumStore, id: &str, timeout: std::time::Duratio
 /// opens the built-in app (via the sync button), which then also pulls remote changes.
 pub struct SyncCoordinator {
     pub plum: PlumStore,
+    /// Full-fidelity Markdown per note; plum alone loses headings, fences,
+    /// tables and other formatting on the way back.
+    markdown: Option<MarkdownStore>,
 }
 
 impl SyncCoordinator {
     pub fn new() -> Result<Self> {
-        Ok(Self { plum: PlumStore::open()? })
+        Ok(Self { plum: PlumStore::open()?, markdown: MarkdownStore::open().ok() })
     }
 
     pub fn reload(&self) -> Result<Vec<crate::store::model::NoteSummary>> {
         self.plum.list_notes()
     }
 
-    pub fn save_note(&self, id: &str, markdown: &str) -> Result<()> {
+    /// Canonical Markdown for a note: our own copy when the plum row is still
+    /// the one we wrote, otherwise the lossy plum projection.
+    pub fn note_markdown(&self, id: &str, plum_text: &str) -> Option<String> {
+        self.markdown.as_ref()?.load(id, plum_text)
+    }
+
+    /// Write a note and return the exact plum text and `UpdatedAt` stored, so
+    /// the caller can tell its own writes apart from external ones.
+    pub fn save_note(&self, id: &str, markdown: &str) -> Result<(String, i64)> {
         ensure_writable()?;
         let plum_text = crate::markup::markdown_to_plum(markdown);
-        self.plum.update_text(id, &plum_text)
+        let updated_at = self.plum.update_text(id, &plum_text)?;
+        if let Some(store) = &self.markdown {
+            // Best effort: losing the shadow copy only costs formatting.
+            let _ = store.save(id, &plum_text, markdown);
+        }
+        Ok((plum_text, updated_at))
+    }
+
+    /// Write a note downloaded from WebDAV into plum (and the Markdown
+    /// shadow). Creates the note when this device has never seen its id.
+    pub fn apply_remote_note(&self, note: &crate::webdav::RemoteNote) -> Result<()> {
+        ensure_writable()?;
+        let plum_text = crate::markup::markdown_to_plum(&note.markdown);
+        if self.plum.get_note_text(&note.id)?.is_some() {
+            self.plum.update_text(&note.id, &plum_text)?;
+        } else {
+            self.plum
+                .insert_note_with_id(&note.id, &plum_text, &note.color, note.updated_at)?;
+        }
+        self.plum.set_theme(&note.id, &note.color)?;
+        if let Some(store) = &self.markdown {
+            let _ = store.save(&note.id, &plum_text, &note.markdown);
+        }
+        Ok(())
     }
 
     pub fn create_note(&self, markdown: &str, theme: &str) -> Result<String> {
         ensure_writable()?;
         let plum_text = crate::markup::markdown_to_plum(markdown);
-        self.plum.insert_note(&plum_text, theme)
+        let id = self.plum.insert_note(&plum_text, theme)?;
+        if let Some(store) = &self.markdown {
+            let _ = store.save(&id, &plum_text, markdown);
+        }
+        Ok(id)
     }
 
     pub fn delete_note(&self, id: &str) -> Result<()> {

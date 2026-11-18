@@ -1,6 +1,6 @@
-use crate::state::{AppState, MdTip, SyncStatus, ThemeSpec, THEMES};
+use crate::state::{AppState, MdTip, SyncStatus, ThemeSpec, WebDavTest, THEMES};
 use gpui_kit::base::{h_flex, v_flex, ElementExt as _};
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::Sizable as _;
@@ -120,6 +120,9 @@ fn lifted_swatch_shadow(dark: bool) -> BoxShadow {
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current_theme = self.current_theme();
+        let settings_modal = self
+            .show_settings
+            .then(|| self.render_settings_modal(window, cx));
 
         v_flex()
             .id("app-root")
@@ -138,6 +141,7 @@ impl Render for AppState {
             // Hover hint for the markdown bar, painted last so it floats over
             // the title below the toolbar.
             .when_some(self.md_tip, |el, tip| el.child(md_tip_overlay(tip)))
+            .when_some(settings_modal, |el, modal| el.child(modal))
     }
 }
 
@@ -664,6 +668,15 @@ impl AppState {
             );
         }
 
+        let webdav_configured = self.config.webdav_configured();
+        let webdav_on = self.config.webdav_auto && webdav_configured;
+        let (dot, webdav_label) = if webdav_on {
+            (0x74B58B, "WebDAV 自动同步")
+        } else if webdav_configured {
+            (0xD8A24A, "WebDAV 已配置")
+        } else {
+            (0xBFC6D1, "WebDAV 未配置")
+        };
         let footer_status = h_flex()
             .px_3()
             .py_2p5()
@@ -671,17 +684,44 @@ impl AppState {
             .border_color(rgb(0xE7EAF0))
             .items_center()
             .gap_2()
+            .justify_between()
             .child(
-                div()
-                    .size(px(7.))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(rgb(0x74B58B)),
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .size(px(7.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(dot)),
+                    )
+                    .child(
+                        Label::new(webdav_label)
+                            .text_size(px(10.5))
+                            .text_color(rgb(0x8B94A3)),
+                    ),
             )
             .child(
-                Label::new("自动同步已开启 · 变更自动载入")
-                    .text_size(px(10.5))
-                    .text_color(rgb(0x8B94A3)),
+                div()
+                    .id("btn-settings")
+                    .size(px(24.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgb(0xEDF0F4)))
+                    .child(
+                        Icon::new(AssetIconName::Settings)
+                            .size(px(14.))
+                            .text_color(rgb(0x6B7480)),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_settings(window, cx);
+                    })),
             );
 
         v_flex()
@@ -1604,6 +1644,17 @@ impl AppState {
                                     rgb(0x8B94A3)
                                 }),
                         )
+                    })
+                    .when(self.native_app_running, |el| {
+                        el.child(
+                            Label::new("Windows 便签正在运行，修改可能被其覆盖")
+                                .text_size(px(10.5))
+                                .text_color(if theme.is_dark {
+                                    rgb(0xE5B567)
+                                } else {
+                                    rgb(0xB07D1E)
+                                }),
+                        )
                     }),
             )
             .child(
@@ -1688,8 +1739,6 @@ impl AppState {
             palette = palette.child(circle);
         }
 
-        // --- 2. (Overflow menu removed for now; palette only.) ---
-
         h_flex()
             .id("canvas-toolbar")
             .w_full()
@@ -1702,4 +1751,308 @@ impl AppState {
             .items_center()
             .child(palette)
     }
+
+    // =========================================================================
+    // Settings modal (WebDAV + sync strategy)
+    // =========================================================================
+    fn render_settings_modal(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let accent = rgb(0x4F7DA8);
+        let text = rgb(0x2B3440);
+        let muted = rgb(0x8B94A3);
+        let border = rgb(0xE4E8EE);
+
+        let test_status = match &self.webdav_test {
+            WebDavTest::Idle => None,
+            WebDavTest::Testing => Some((rgb(0x8B94A3), "正在连接…".to_string())),
+            WebDavTest::Ok(msg) => Some((rgb(0x2F8F5B), format!("✓ {msg}"))),
+            WebDavTest::Err(msg) => Some((rgb(0xC04646), format!("✕ {msg}"))),
+        };
+        let testing = self.webdav_test == WebDavTest::Testing;
+
+        // Each field carries its own element id: gpui-base gives every text
+        // editor the same internal id ("input-state"), and the accessibility
+        // node id is hashed from the chain of enclosing ids. Without a unique
+        // id per row all four inputs collapse onto one a11y node and gpui
+        // panics with "Duplicate a11y node id" on the first focus change.
+        let field = |key: &'static str,
+                     label: &str,
+                     input: &Entity<InputState>,
+                     password: bool,
+                     muted: Rgba| {
+            v_flex()
+                .id(key)
+                .gap(px(6.))
+                .child(Label::new(label.to_string()).text_size(px(11.5)).text_color(muted))
+                .child(
+                    div()
+                        .h(px(34.))
+                        .px_2p5()
+                        .flex()
+                        .items_center()
+                        .rounded(px(8.))
+                        .bg(rgb(0xFFFFFF))
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            div().flex_1().min_w_0().child({
+                                let mut widget =
+                                    Input::new(input).appearance(false).focus_bordered(false);
+                                if password {
+                                    widget = widget.mask_toggle();
+                                }
+                                widget
+                            }),
+                        ),
+                )
+        };
+
+        let mut rows = v_flex().gap(px(16.));
+
+        // --- Sync strategy switches ---
+        let webdav_on = self.config.webdav_auto;
+        let ms_on = self.config.microsoft;
+        rows = rows.child(
+            div()
+                .rounded(px(10.))
+                .bg(rgb(0xF7F9FB))
+                .border_1()
+                .border_color(border)
+                .p(px(14.))
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(Label::new("自动同步（WebDAV）").text_size(px(12.5)).text_color(text))
+                                .child(
+                                    Label::new("编辑后约 2.5 秒上传；启动与后台定时拉取")
+                                        .text_size(px(10.5))
+                                        .text_color(muted),
+                                ),
+                        )
+                        .child(
+                            settings_switch("sw-webdav", webdav_on, accent).on_click(
+                                cx.listener(|this, _, _window, cx| {
+                                    let on = !this.config.webdav_auto;
+                                    this.set_webdav_auto(on, cx);
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    Label::new("同步微软账户（Windows 便签）")
+                                        .text_size(px(12.5))
+                                        .text_color(text),
+                                )
+                                .child(
+                                    Label::new("可选；开启后会跟随原生便签与云端的变化")
+                                        .text_size(px(10.5))
+                                        .text_color(muted),
+                                ),
+                        )
+                        .child(
+                            settings_switch("sw-microsoft", ms_on, accent).on_click(
+                                cx.listener(|this, _, _window, cx| {
+                                    let on = !this.config.microsoft;
+                                    this.set_microsoft_sync(on, cx);
+                                }),
+                            ),
+                        ),
+                ),
+        );
+
+        // --- WebDAV form ---
+        let mut form = v_flex().gap(px(12.));
+        form = form.child(Label::new("WebDAV 服务器").text_size(px(12.)).text_color(text));
+        if let Some(inputs) = &self.settings {
+            form = form
+                .child(field("settings-url", "服务器地址（URL）", &inputs.url, false, muted))
+                .child(field("settings-user", "用户名", &inputs.user, false, muted))
+                .child(field("settings-pass", "密码", &inputs.pass, true, muted))
+                .child(field("settings-dir", "远端同步目录", &inputs.dir, false, muted));
+        }
+
+        let sync_label = if self.webdav_syncing { "同步中…" } else { "立即同步" };
+        let mut actions = h_flex().items_center().gap_3().child(
+            div()
+                .id("btn-webdav-test")
+                .h(px(32.))
+                .px_4()
+                .flex()
+                .items_center()
+                .rounded(px(8.))
+                .bg(if testing { rgb(0xE8EDF3) } else { accent })
+                .cursor_pointer()
+                .child(
+                    Label::new(if testing { "测试中…" } else { "测试连接" })
+                        .text_size(px(12.))
+                        .text_color(if testing { rgb(0x6B7480) } else { rgb(0xFFFFFF) }),
+                )
+                .when(!testing, |el| {
+                    el.on_click(cx.listener(|this, _, window, cx| this.test_webdav(window, cx)))
+                }),
+        );
+        actions = actions.child(
+            div()
+                .id("btn-webdav-sync")
+                .h(px(32.))
+                .px_4()
+                .flex()
+                .items_center()
+                .rounded(px(8.))
+                .bg(rgb(0xFFFFFF))
+                .border_1()
+                .border_color(border)
+                .cursor_pointer()
+                .hover(|el| el.bg(rgb(0xF2F5F9)))
+                .child(
+                    Label::new(sync_label)
+                        .text_size(px(12.))
+                        .text_color(if self.webdav_syncing { muted } else { text }),
+                )
+                .when(!self.webdav_syncing, |el| {
+                    el.on_click(cx.listener(|this, _, window, cx| {
+                        this.start_webdav_sync(window, cx)
+                    }))
+                }),
+        );
+        if let Some((color, msg)) = test_status {
+            actions = actions.child(
+                Label::new(msg)
+                    .text_size(px(11.))
+                    .text_color(color),
+            );
+        } else if let Some(msg) = &self.webdav_message {
+            actions = actions.child(Label::new(msg.clone()).text_size(px(11.)).text_color(muted));
+        }
+        form = form.child(actions);
+        form = form.child(
+            Label::new("每条便签保存为 <id>.md，带 YAML Frontmatter，可在任意 Markdown 编辑器中阅读。")
+                .text_size(px(10.5))
+                .text_color(muted),
+        );
+        rows = rows.child(form);
+
+        let card = v_flex()
+            .id("settings-card")
+            .w(px(540.))
+            .max_h(px(660.))
+            .rounded(px(14.))
+            .bg(rgb(0xFFFFFF))
+            .shadow(vec![BoxShadow {
+                inset: false,
+                color: hsla(0., 0., 0., 0.24),
+                offset: point(px(0.), px(18.)),
+                blur_radius: px(48.),
+                spread_radius: px(0.),
+            }])
+            .p(px(22.))
+            .gap(px(16.))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .gap(px(2.))
+                            .child(Label::new("设置").text_size(px(17.)).text_color(text))
+                            .child(
+                                Label::new("数据同步与 WebDAV")
+                                    .text_size(px(11.))
+                                    .text_color(muted),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("btn-settings-close")
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(rgb(0xF0F3F7)))
+                            .child(
+                                Icon::new(AssetIconName::X)
+                                    .size(px(14.))
+                                    .text_color(rgb(0x6B7480)),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_settings(window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(rows),
+            )
+            // Clicks inside the card must not reach the backdrop.
+            .on_click(|_, _, cx| cx.stop_propagation());
+
+        div()
+            .id("settings-backdrop")
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(hsla(0., 0., 0., 0.34))
+            .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                    this.close_settings(window, cx);
+                }
+            }))
+            .child(card)
+            .into_any_element()
+    }
+}
+
+/// Compact on/off switch used in the settings dialog.
+fn settings_switch(id: &'static str, on: bool, accent: Rgba) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(38.))
+        .h(px(22.))
+        .flex_none()
+        .rounded(px(11.))
+        .bg(if on { accent } else { rgb(0xD5DAE2) })
+        .cursor_pointer()
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .top(px(2.))
+                .left(if on { px(18.) } else { px(2.) })
+                .size(px(18.))
+                .rounded_full()
+                .bg(rgb(0xFFFFFF))
+                .shadow(vec![BoxShadow {
+                    inset: false,
+                    color: hsla(0., 0., 0., 0.18),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                }]),
+        )
 }

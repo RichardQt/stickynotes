@@ -2,10 +2,12 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 use markdown_editor::{BlockEditorEvent, BlockEditorState};
 use stickynotes_core::{
+    config::SyncConfig,
     markup,
     store::model::NoteSummary,
     sync::{self, SyncCoordinator},
     tags::{Tag, TagStore},
+    webdav,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -117,6 +119,23 @@ pub enum SyncStatus {
     Busy(String),
 }
 
+/// Result of the settings dialog's "test connection" probe.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WebDavTest {
+    Idle,
+    Testing,
+    Ok(String),
+    Err(String),
+}
+
+/// Settings dialog form fields, created on first open.
+pub struct SettingsInputs {
+    pub url: Entity<InputState>,
+    pub user: Entity<InputState>,
+    pub pass: Entity<InputState>,
+    pub dir: Entity<InputState>,
+}
+
 /// Cheap change fingerprint for the plum database: (mtime nanos, length) of
 /// the main file and of the WAL, which is where WAL-mode writes land first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +163,42 @@ fn plum_signature(plum_path: &Path) -> DbSignature {
     DbSignature {
         main: file_sig(plum_path),
         wal: file_sig(&plum_path.with_extension("sqlite-wal")),
+    }
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Opt-in diagnostics: set `STICKYNOTES_DEBUG=1` to append save/sync decisions
+/// (note-id prefix, text lengths, flags — never note content) to
+/// `%LOCALAPPDATA%\stickynotes\debug.log`.
+fn debug_log(msg: &str) {
+    use std::io::Write as _;
+    if std::env::var_os("STICKYNOTES_DEBUG").is_none() {
+        return;
+    }
+    let Ok(local) = std::env::var("LOCALAPPDATA") else {
+        return;
+    };
+    let dir = Path::new(&local).join("stickynotes");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("debug.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1_000_000 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{ms} {msg}");
     }
 }
 
@@ -185,10 +240,29 @@ pub struct AppState {
     /// Last editor content successfully written to plum (used to tell whether
     /// replacing the editor from disk would discard unsaved edits).
     pub last_saved_md: Option<String>,
-    /// A save failed because the DB was momentarily locked; retry on the next poll.
-    pub pending_save: bool,
+    /// Exact plum text of our last successful write for the open note. Lets the
+    /// poll skip the row when the only change on disk is our own save, instead
+    /// of round-tripping it through Markdown and rewriting the editor.
+    pub last_saved_plum: Option<String>,
+    /// A save failed because the DB was momentarily locked: the note id and
+    /// Markdown to retry, captured at failure time.
+    pub pending_save: Option<(String, String)>,
     /// Fingerprint (mtime, size) of plum.sqlite + its WAL, to detect external writes.
     db_sig: Option<DbSignature>,
+    /// Is the native Sticky Notes app open? It owns the cloud sync and keeps
+    /// its own copy of every note, which it can write back over ours.
+    pub native_app_running: bool,
+    poll_ticks: u32,
+
+    // Settings & WebDAV sync
+    pub config: SyncConfig,
+    pub show_settings: bool,
+    pub settings: Option<SettingsInputs>,
+    pub webdav_test: WebDavTest,
+    pub webdav_syncing: bool,
+    pub webdav_message: Option<String>,
+    /// Bumped on every edit so only the last debounced WebDAV push runs.
+    webdav_epoch: u64,
 
     // UI state toggles
     pub show_sidebar_add_tag: bool,
@@ -251,6 +325,7 @@ impl AppState {
         })
         .detach();
 
+        let config = SyncConfig::load();
         let window_handle = window.window_handle();
         let mut app = Self {
             sync,
@@ -269,8 +344,18 @@ impl AppState {
             save_epoch: 0,
             current_stats: (0, 0),
             last_saved_md: None,
-            pending_save: false,
+            last_saved_plum: None,
+            pending_save: None,
             db_sig: None,
+            native_app_running: false,
+            poll_ticks: 0,
+            config,
+            show_settings: false,
+            settings: None,
+            webdav_test: WebDavTest::Idle,
+            webdav_syncing: false,
+            webdav_message: None,
+            webdav_epoch: 0,
             show_sidebar_add_tag: false,
             new_tag_input: Some(new_tag_input),
             search_input: Some(search_input),
@@ -287,6 +372,11 @@ impl AppState {
             app.select_note_by_index(0, window, cx);
         }
         app.start_auto_sync(window, cx);
+        // Pull WebDAV changes once at startup; silent when the server is not
+        // configured yet.
+        if app.config.webdav_auto && app.config.webdav_configured() {
+            app.start_webdav_sync(window, cx);
+        }
         app
     }
 
@@ -371,9 +461,12 @@ impl AppState {
     pub fn ensure_selection_after_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let filtered = self.filtered_notes();
         if filtered.is_empty() {
+            self.flush_pending_save(cx);
             self.selected_id = None;
             self.editor = None;
             self.title_input = None;
+            self.last_saved_md = None;
+            self.last_saved_plum = None;
             self.current_stats = (0, 0);
         } else if !filtered.iter().any(|n| Some(&n.id) == self.selected_id.as_ref()) {
             self.select_note_by_index(0, window, cx);
@@ -384,10 +477,24 @@ impl AppState {
         if self.selected_id.as_deref() == Some(id) && self.editor.is_some() {
             return;
         }
+        // The debounced autosave may still be pending for the note we are
+        // leaving. Flush it before its editor is replaced — otherwise the
+        // timer fires against the *new* editor and the edit is silently lost.
+        self.flush_pending_save(cx);
+
         let Some(plum_text) = self.sync.plum.get_note_text(id).ok().flatten() else {
             return;
         };
-        let md = markup::plum_to_markdown(&plum_text);
+        // Prefer our full-fidelity copy: plum cannot hold headings, fences,
+        // tables and so on, so converting back would strip the formatting.
+        let stored = self.sync.note_markdown(id, &plum_text);
+        let md = stored.clone().unwrap_or_else(|| markup::plum_to_markdown(&plum_text));
+        debug_log(&format!(
+            "select id={} len={} shadow={}",
+            short_id(id),
+            md.len(),
+            stored.is_some()
+        ));
         // The first paragraph is the note title; the rest is the body.
         let (title, body) = Self::split_title_body(&md);
         let scroll = self.scroll.clone();
@@ -454,10 +561,12 @@ impl AppState {
         self.editor = Some(editor);
         self.title_input = Some(title_input);
         self.selected_id = Some(id.to_string());
-        self.pending_save = false;
+        self.pending_save = None;
         // Store the composed document (title + body): the auto-sync check
-        // compares it against `compose_md` later.
+        // compares it against `compose_md` later. `last_saved_plum` is the
+        // exact row text we loaded, so a poll can recognise it as unchanged.
         self.last_saved_md = Some(self.compose_md(cx));
+        self.last_saved_plum = Some(plum_text);
         self.update_stats_from_editor(cx);
         cx.notify();
     }
@@ -529,10 +638,30 @@ impl AppState {
         }
     }
 
+    /// Persist the open note's last edit *before* its editor is replaced.
+    ///
+    /// Saves are debounced by 400ms. A note or tag switch inside that window
+    /// would otherwise swap the editor first, and the timer would then write
+    /// the new note's text (or nothing), silently losing the edit — which then
+    /// looks like the old note "reverting" on the next visit.
+    fn flush_pending_save(&mut self, cx: &mut Context<Self>) {
+        if self.editor.is_none() {
+            return;
+        }
+        let dirty = self.last_saved_md.as_deref() != Some(self.compose_md(cx).as_str());
+        debug_log(&format!("flush dirty={dirty}"));
+        if dirty {
+            self.save_current(cx);
+        }
+        // Invalidate any debounce timer captured against the old editor.
+        self.save_epoch = self.save_epoch.wrapping_add(1);
+    }
+
     /// Debounced autosave: 400ms after the last edit, cancelling previous pending saves via epoch.
     fn schedule_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_epoch = self.save_epoch.wrapping_add(1);
         let epoch = self.save_epoch;
+        debug_log(&format!("schedule epoch={epoch}"));
         let this = cx.weak_entity();
 
         // Note: Heavy string/AST serialization is decoupled from keystrokes
@@ -542,9 +671,10 @@ impl AppState {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(400))
                 .await;
-            this.update_in(cx, |this, _window, cx| {
+            this.update_in(cx, |this, window, cx| {
                 if this.save_epoch == epoch {
                     this.save_current(cx);
+                    this.schedule_webdav_sync(window, cx);
                 }
             })
             .ok();
@@ -560,24 +690,44 @@ impl AppState {
             return;
         }
         let md = self.compose_md(cx);
+        debug_log(&format!("save id={} len={}", short_id(&id), md.len()));
         match self.sync.save_note(&id, &md) {
-            Ok(()) => {
+            Ok((plum_text, updated_at)) => {
+                // Did the row actually keep our text, and does the Markdown
+                // survive a plum round trip? (No note content is logged.)
+                let stick = self.sync.plum.get_note_text(&id).ok().flatten().as_deref()
+                    == Some(plum_text.as_str());
+                let rt = markup::plum_to_markdown(&plum_text);
+                debug_log(&format!(
+                    "save ok stick={stick} rt_eq={} md={} rt={}",
+                    rt == md,
+                    md.len(),
+                    rt.len()
+                ));
                 self.status = SyncStatus::Saved("已自动保存".into());
                 self.last_saved_md = Some(md.clone());
-                self.pending_save = false;
+                self.last_saved_plum = Some(plum_text);
+                self.pending_save = None;
                 // Our own write must not look like an external change.
                 self.refresh_db_sig();
+                if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
+                    note.updated_at = Some(updated_at);
+                }
+                debug_log("save ok");
             }
             Err(e) => {
                 let msg = format!("{e}");
                 // The Windows app may hold the write lock for a moment; the
-                // background poll retries instead of losing the edit.
-                self.pending_save = msg.contains("locked") || msg.contains("busy");
-                self.status = if self.pending_save {
+                // background poll retries the exact text that failed instead
+                // of losing the edit.
+                let retryable = msg.contains("locked") || msg.contains("busy");
+                self.pending_save = retryable.then(|| (id.clone(), md.clone()));
+                self.status = if retryable {
                     SyncStatus::Busy("数据库被占用，正在自动重试保存…".into())
                 } else {
-                    SyncStatus::Error(msg)
+                    SyncStatus::Error(msg.clone())
                 };
+                debug_log(&format!("save err retryable={retryable} msg={msg}"));
             }
         }
 
@@ -587,7 +737,6 @@ impl AppState {
         if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
             note.title = title;
             note.snippet = snippet;
-            note.updated_at = Some(stickynotes_core::ticks::now_ticks());
         }
         self.update_stats_from_editor(cx);
         cx.notify();
@@ -621,6 +770,18 @@ impl AppState {
     /// Delete an arbitrary note — used by the card context menu, where the
     /// target is not necessarily the selected note.
     pub fn delete_note_by_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Deleting the open note drops its pending debounce; writing it after
+        // the soft delete would bump UpdatedAt on a tombstone. Deleting another
+        // note flushes the open one so no edit is lost.
+        if self.selected_id.as_deref() == Some(id) {
+            self.save_epoch = self.save_epoch.wrapping_add(1);
+            self.pending_save = None;
+            self.selected_id = None;
+            self.editor = None;
+            self.title_input = None;
+            self.last_saved_md = None;
+            self.last_saved_plum = None;
+        }
         match self.sync.delete_note(id) {
             Ok(()) => {
                 self.status = SyncStatus::Saved("便签已删除".into());
@@ -685,23 +846,24 @@ impl AppState {
         cx.notify();
     }
 
-    /// Kept for the editor overflow menu, which is temporarily hidden.
+    /// Push local changes through the native app's Microsoft sync. Kept for
+    /// the Microsoft toggle path; the top-bar button is gone.
     #[allow(dead_code)]
     pub fn cloud_sync(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.save_current(cx);
         if sync::is_sticky_notes_running() {
-            self.status = SyncStatus::Busy(
-                "Windows 便签正在运行，修改会自动载入；云端同步由其完成".into(),
-            );
+            self.status =
+                SyncStatus::Busy("Windows 便签已打开，正在上传本地修改…".into());
             cx.notify();
             return;
         }
-        self.status = SyncStatus::Busy("已拉起 Windows 便签（云同步中），修改会自动载入".into());
+        self.status = SyncStatus::Busy("已打开 Windows 便签，正在上传本地修改…".into());
         let _ = sync::launch_sticky_notes();
         cx.notify();
     }
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_pending_save(cx);
         match self.sync.reload() {
             Ok(notes) => {
                 self.notes = notes;
@@ -715,6 +877,7 @@ impl AppState {
         let keep = self.selected_id.clone();
         self.selected_id = None;
         self.editor = None;
+        self.last_saved_plum = None;
         if !self.notes.is_empty() {
             let idx = keep
                 .and_then(|id| self.notes.iter().position(|n| n.id == id))
@@ -842,6 +1005,13 @@ impl AppState {
                     if this
                         .update_in(cx, |this, window, cx| {
                             this.poll_external_changes(window, cx);
+                            // Background WebDAV pull, roughly once a minute.
+                            if this.poll_ticks % 30 == 0
+                                && this.config.webdav_auto
+                                && !this.webdav_syncing
+                            {
+                                this.start_webdav_sync(window, cx);
+                            }
                         })
                         .is_err()
                     {
@@ -852,9 +1022,289 @@ impl AppState {
             .detach();
     }
 
+    // --- Settings dialog & WebDAV sync ---
+
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_settings_inputs(window, cx);
+        self.show_settings = true;
+        self.webdav_test = WebDavTest::Idle;
+        if let Some(s) = &self.settings {
+            let handle = s.url.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    fn ensure_settings_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        let w = self.config.webdav.clone();
+        let url = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("https://example.com/dav/");
+            s.set_value(w.url.clone(), window, cx);
+            s
+        });
+        let user = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("请输入 WebDAV 用户名");
+            s.set_value(w.username.clone(), window, cx);
+            s
+        });
+        let pass = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("请输入密码或应用专用密码");
+            s.set_value(w.password.clone(), window, cx);
+            s.set_masked(true, window, cx);
+            s
+        });
+        let dir = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("/StickyNotes/");
+            let dir = if w.dir.trim().is_empty() { "/StickyNotes/".to_string() } else { w.dir.clone() };
+            s.set_value(dir, window, cx);
+            s
+        });
+        self.settings = Some(SettingsInputs { url, user, pass, dir });
+    }
+
+    /// Copy the form back into the config and persist it.
+    fn persist_settings(&mut self, cx: &App) {
+        if let Some(s) = &self.settings {
+            self.config.webdav.url = s.url.read(cx).value().trim().to_string();
+            self.config.webdav.username = s.user.read(cx).value().trim().to_string();
+            self.config.webdav.password = s.pass.read(cx).value().to_string();
+            let dir = s.dir.read(cx).value().trim().to_string();
+            self.config.webdav.dir = if dir.is_empty() {
+                "/StickyNotes/".into()
+            } else {
+                dir
+            };
+        }
+        if let Err(e) = self.config.save() {
+            self.status = SyncStatus::Error(format!("保存设置失败：{e}"));
+        }
+    }
+
+    pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.persist_settings(cx);
+        self.show_settings = false;
+        // A fresh configuration is worth an immediate (debounced) sync.
+        self.schedule_webdav_sync(window, cx);
+        cx.notify();
+    }
+
+    pub fn set_webdav_auto(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.config.webdav_auto = on;
+        let _ = self.config.save();
+        cx.notify();
+    }
+
+    pub fn set_microsoft_sync(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.config.microsoft = on;
+        let _ = self.config.save();
+        if !on {
+            // No longer following the native app; forget its state.
+            self.native_app_running = false;
+        }
+        cx.notify();
+    }
+
+    pub fn test_webdav(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.persist_settings(cx);
+        let cfg = self.config.webdav.clone();
+        if cfg.url.trim().is_empty() || cfg.username.trim().is_empty() || cfg.password.is_empty()
+        {
+            self.webdav_test = WebDavTest::Err("请先填写服务器地址、用户名和密码".into());
+            cx.notify();
+            return;
+        }
+        self.webdav_test = WebDavTest::Testing;
+        cx.notify();
+
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { webdav::test_connection(&cfg) })
+                    .await;
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    this.webdav_test = match result {
+                        Ok(msg) => WebDavTest::Ok(msg),
+                        Err(e) => WebDavTest::Err(e),
+                    };
+                    cx.notify();
+                });
+            })
+            .detach();
+    }
+
+    /// One full WebDAV sync in the background. Silent when not configured.
+    pub fn start_webdav_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.webdav_syncing {
+            return;
+        }
+        if self.show_settings {
+            self.persist_settings(cx);
+        }
+        if !self.config.webdav_configured() {
+            if self.show_settings {
+                self.webdav_message = Some("请先填写服务器地址、用户名和密码".into());
+                cx.notify();
+            }
+            return;
+        }
+
+        // Make sure the note being edited is on disk before we snapshot.
+        self.flush_pending_save(cx);
+
+        self.webdav_syncing = true;
+        self.webdav_message = Some("正在同步…".into());
+        let cfg = self.config.webdav.clone();
+        let notes = self.local_sync_notes(cx);
+        let this = cx.weak_entity();
+        cx.notify();
+
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { webdav::sync(&cfg, &notes) })
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.finish_webdav_sync(result, window, cx);
+                });
+            })
+            .detach();
+    }
+
+    /// Debounce WebDAV uploads so a burst of typing becomes one sync.
+    fn schedule_webdav_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.config.webdav_auto || !self.config.webdav_configured() {
+            return;
+        }
+        self.webdav_epoch = self.webdav_epoch.wrapping_add(1);
+        let epoch = self.webdav_epoch;
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(2500))
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if this.webdav_epoch == epoch {
+                        this.start_webdav_sync(window, cx);
+                    }
+                });
+            })
+            .detach();
+    }
+
+    fn local_sync_notes(&self, _cx: &App) -> Vec<webdav::SyncNote> {
+        self.notes
+            .iter()
+            .filter_map(|note| {
+                let plum = self.sync.plum.get_note_text(&note.id).ok().flatten()?;
+                let md = self
+                    .sync
+                    .note_markdown(&note.id, &plum)
+                    .unwrap_or_else(|| markup::plum_to_markdown(&plum));
+                let (title, _) = Self::split_title_body(&md);
+                Some(webdav::SyncNote {
+                    id: note.id.clone(),
+                    title,
+                    color: note.theme.clone().unwrap_or_else(|| "Yellow".into()),
+                    tags: self
+                        .tags_for_note(&note.id)
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect(),
+                    pinned: self.is_pinned(&note.id),
+                    updated_at: note.updated_at.unwrap_or(0),
+                    markdown: md,
+                })
+            })
+            .collect()
+    }
+
+    fn finish_webdav_sync(
+        &mut self,
+        result: Result<webdav::SyncReport, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.webdav_syncing = false;
+        match result {
+            Ok(report) => {
+                if !report.remote_notes.is_empty() {
+                    // Save local edits first; the remote note then wins only
+                    // where its `updated_at` is newer (decided by the sync).
+                    self.flush_pending_save(cx);
+                    for note in &report.remote_notes {
+                        if let Err(e) = self.sync.apply_remote_note(note) {
+                            self.status = SyncStatus::Error(format!("写入远端便签失败：{e}"));
+                            continue;
+                        }
+                        // Replace the local tag set and pin state with the remote.
+                        if let Ok(existing) = self.tags.tags_of_note(&note.id) {
+                            for tag_id in existing {
+                                let _ = self.tags.untag_note(&note.id, tag_id);
+                            }
+                        }
+                        for name in &note.tags {
+                            if let Ok(tag_id) = self.tags.create_tag(name) {
+                                let _ = self.tags.tag_note(&note.id, tag_id);
+                            }
+                        }
+                        let _ = self.tags.set_pinned(&note.id, note.pinned);
+                    }
+                    self.reload_tags_cache();
+                    self.prune_tag_orphans();
+                    self.reload(window, cx);
+                }
+                let summary = report.summary();
+                self.webdav_message = Some(summary.clone());
+                self.status = SyncStatus::Saved(summary);
+            }
+            Err(e) => {
+                self.webdav_message = Some(format!("同步失败：{e}"));
+                self.status = SyncStatus::Error(format!("WebDAV 同步失败：{e}"));
+            }
+        }
+        cx.notify();
+    }
+
     fn poll_external_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_save {
-            self.save_current(cx);
+        // The native app's process state is cheap to check but not free
+        // (a tasklist spawn): refresh it every ~10s, not every poll.
+        self.poll_ticks = self.poll_ticks.wrapping_add(1);
+        if self.poll_ticks % 5 == 1 {
+            self.native_app_running = sync::is_sticky_notes_running();
+        }
+
+        // Retry the exact text that failed, even if the selection has moved on
+        // since — never the current editor's content, which belongs to another note.
+        if let Some((id, md)) = self.pending_save.clone() {
+            match self.sync.save_note(&id, &md) {
+                Ok((plum_text, updated_at)) => {
+                    self.pending_save = None;
+                    if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
+                        note.updated_at = Some(updated_at);
+                    }
+                    if self.selected_id.as_deref() == Some(id.as_str()) {
+                        self.last_saved_md = Some(md);
+                        self.last_saved_plum = Some(plum_text);
+                    }
+                    self.refresh_db_sig();
+                    self.status = SyncStatus::Saved("已自动保存".into());
+                    debug_log("retry save ok");
+                }
+                Err(_) => debug_log("retry save err"),
+            }
+        }
+
+        // Microsoft-account sync is opt-in: by default the companion app does
+        // not follow edits made in the native app or its cloud.
+        if !self.config.microsoft {
+            return;
         }
 
         let sig = plum_signature(self.sync.plum.path());
@@ -862,6 +1312,7 @@ impl AppState {
             return;
         }
         self.db_sig = Some(sig);
+        debug_log(&format!("poll sig changed native={}", self.native_app_running));
 
         let Ok(notes) = self.sync.reload() else {
             return;
@@ -888,6 +1339,7 @@ impl AppState {
             self.editor = None;
             self.title_input = None;
             self.last_saved_md = None;
+            self.last_saved_plum = None;
             self.ensure_selection_after_filter(window, cx);
             self.status = SyncStatus::Saved("检测到外部删除，已自动更新列表".into());
             cx.notify();
@@ -907,8 +1359,17 @@ impl AppState {
             let local = self.compose_md(cx);
             if self.last_saved_md.as_deref() == Some(local.as_str()) {
                 if let Ok(Some(plum_text)) = self.sync.plum.get_note_text(&id) {
-                    let md = markup::plum_to_markdown(&plum_text);
-                    if md != local {
+                    // If the row is byte-for-byte what we last wrote, this is
+                    // our own save seen back through the WAL: the Markdown after
+                    // a plum round trip is merely canonicalised, and replacing
+                    // the editor with it would look like the edit reverting.
+                    // Only a genuinely different row is an external write.
+                    let ours = self.last_saved_plum.as_deref() == Some(plum_text.as_str());
+                    let md = self
+                        .sync
+                        .note_markdown(&id, &plum_text)
+                        .unwrap_or_else(|| markup::plum_to_markdown(&plum_text));
+                    if !ours && md != local {
                         let (title, body) = Self::split_title_body(&md);
                         let ok = editor.update(cx, |state, cx| state.set_source(&body, cx).is_ok());
                         if ok {
@@ -919,9 +1380,11 @@ impl AppState {
                             // scheduled — this content came from disk, not the user.
                             self.save_epoch = self.save_epoch.wrapping_add(1);
                             self.last_saved_md = Some(self.compose_md(cx));
+                            self.last_saved_plum = Some(plum_text);
                             self.update_stats_from_editor(cx);
                         }
                     }
+                    debug_log(&format!("poll note ours={ours} md_eq={}", md == local));
                 }
             }
         }
