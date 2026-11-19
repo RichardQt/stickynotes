@@ -6843,8 +6843,10 @@ name = "stickynotes-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "embed-resource",
  "gpui-kit",
  "gpui-kit-markdown-editor",
+ "resvg 0.46.0",
  "stickynotes-core",
  "uuid",
 ]
