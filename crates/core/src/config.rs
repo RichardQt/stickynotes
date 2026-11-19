@@ -43,8 +43,10 @@ pub struct SyncConfig {
     /// WebDAV sync: debounced upload after edits + periodic background pull.
     #[serde(default = "default_true")]
     pub webdav_auto: bool,
-    /// Opt-in: follow the native Windows Sticky Notes account changes and
-    /// let its own engine push our edits to the Microsoft cloud.
+    /// Opt-in: follow edits made in the native Windows Sticky Notes app and
+    /// its cloud. The cloud exchange itself is performed by that app whenever
+    /// it runs; plum only stores plain text (no headings, fences or tables),
+    /// so this path never carries the Markdown formatting kept for WebDAV.
     #[serde(default)]
     pub microsoft: bool,
     #[serde(default)]

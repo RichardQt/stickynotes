@@ -108,11 +108,17 @@ impl SyncCoordinator {
 
     /// Write a note downloaded from WebDAV into plum (and the Markdown
     /// shadow). Creates the note when this device has never seen its id.
+    ///
+    /// The plum row keeps the remote `updated_at`: stamping local time here
+    /// would make the note look newer than the file it came from, so every
+    /// later pass would re-upload it and the two devices would ping-pong the
+    /// same content forever.
     pub fn apply_remote_note(&self, note: &crate::webdav::RemoteNote) -> Result<()> {
         ensure_writable()?;
         let plum_text = crate::markup::markdown_to_plum(&note.markdown);
         if self.plum.get_note_text(&note.id)?.is_some() {
-            self.plum.update_text(&note.id, &plum_text)?;
+            self.plum
+                .update_text_at(&note.id, &plum_text, Some(note.updated_at))?;
         } else {
             self.plum
                 .insert_note_with_id(&note.id, &plum_text, &note.color, note.updated_at)?;

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Visual spec for plum themes with refined paper aesthetics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +25,6 @@ pub struct ThemeSpec {
     pub paper_bg: u32,
     pub card_active_bg: u32,
     pub border: u32,
-    pub is_dark: bool,
 }
 
 pub const THEMES: &[ThemeSpec] = &[
@@ -36,7 +35,6 @@ pub const THEMES: &[ThemeSpec] = &[
         paper_bg: 0xFFFDF4,
         card_active_bg: 0xFBF3D0,
         border: 0xF0E4B8,
-        is_dark: false,
     },
     ThemeSpec {
         name: "Green",
@@ -45,7 +43,6 @@ pub const THEMES: &[ThemeSpec] = &[
         paper_bg: 0xF3FBF5,
         card_active_bg: 0xDFF2E4,
         border: 0xC4E6CC,
-        is_dark: false,
     },
     ThemeSpec {
         name: "Pink",
@@ -54,7 +51,6 @@ pub const THEMES: &[ThemeSpec] = &[
         paper_bg: 0xFDF5F8,
         card_active_bg: 0xF7E1E9,
         border: 0xEFD0DB,
-        is_dark: false,
     },
     ThemeSpec {
         name: "Purple",
@@ -63,7 +59,6 @@ pub const THEMES: &[ThemeSpec] = &[
         paper_bg: 0xF9F6FD,
         card_active_bg: 0xEBE2F6,
         border: 0xDCCFF0,
-        is_dark: false,
     },
     ThemeSpec {
         name: "Blue",
@@ -72,7 +67,6 @@ pub const THEMES: &[ThemeSpec] = &[
         paper_bg: 0xF2F8FC,
         card_active_bg: 0xDFECF4,
         border: 0xC6DDEA,
-        is_dark: false,
     },
     ThemeSpec {
         name: "Gray",
@@ -81,16 +75,6 @@ pub const THEMES: &[ThemeSpec] = &[
         paper_bg: 0xF9FAFB,
         card_active_bg: 0xEEF1F4,
         border: 0xE0E5EA,
-        is_dark: false,
-    },
-    ThemeSpec {
-        name: "Charcoal",
-        label: "暗夜黑",
-        accent: 0x8A8A93,
-        paper_bg: 0x212126,
-        card_active_bg: 0x2C2C33,
-        border: 0x3F3F46,
-        is_dark: true,
     },
     ThemeSpec {
         name: "White",
@@ -99,12 +83,18 @@ pub const THEMES: &[ThemeSpec] = &[
         paper_bg: 0xFFFFFF,
         card_active_bg: 0xF3F4F6,
         border: 0xE8EAEF,
-        is_dark: false,
     },
 ];
 
 pub fn get_theme(name: Option<&str>) -> &'static ThemeSpec {
-    let target = name.unwrap_or("Yellow");
+    // The native app also offers a dark "Charcoal" paper. This app draws only
+    // light papers, so such a note is shown on the neutral gray one. Its
+    // stored theme stays as it is until a colour is picked here.
+    let target = match name {
+        Some(n) if n.eq_ignore_ascii_case("Charcoal") => "Gray",
+        Some(n) => n,
+        None => "Yellow",
+    };
     THEMES
         .iter()
         .find(|t| t.name.eq_ignore_ascii_case(target))
@@ -263,6 +253,21 @@ pub struct AppState {
     pub webdav_message: Option<String>,
     /// Bumped on every edit so only the last debounced WebDAV push runs.
     webdav_epoch: u64,
+    /// Remote file versions from the last pass. Lets a pull skip unchanged
+    /// files (one PROPFIND, no downloads) and survives restarts.
+    webdav_cache: webdav::SyncCache,
+    /// Notes deleted locally whose remote `.md` must be removed on the next
+    /// pass. Without it a delete would resurrect from the server.
+    webdav_deletions: webdav::DeleteLedger,
+    /// The remote collection has been created/confirmed during this run.
+    webdav_dir_ready: bool,
+    /// Consecutive failed background passes, for exponential backoff.
+    webdav_failures: u32,
+    /// No background pass starts before this instant.
+    webdav_next_try: Instant,
+    /// A sync was requested while one was running; run once more afterwards
+    /// instead of dropping the request.
+    webdav_pending: bool,
 
     // UI state toggles
     pub show_sidebar_add_tag: bool,
@@ -356,6 +361,12 @@ impl AppState {
             webdav_syncing: false,
             webdav_message: None,
             webdav_epoch: 0,
+            webdav_cache: webdav::SyncCache::load(),
+            webdav_deletions: webdav::DeleteLedger::load(),
+            webdav_dir_ready: false,
+            webdav_failures: 0,
+            webdav_next_try: Instant::now(),
+            webdav_pending: false,
             show_sidebar_add_tag: false,
             new_tag_input: Some(new_tag_input),
             search_input: Some(search_input),
@@ -375,7 +386,7 @@ impl AppState {
         // Pull WebDAV changes once at startup; silent when the server is not
         // configured yet.
         if app.config.webdav_auto && app.config.webdav_configured() {
-            app.start_webdav_sync(window, cx);
+            app.start_webdav_sync(window, cx, false);
         }
         app
     }
@@ -499,35 +510,16 @@ impl AppState {
         let (title, body) = Self::split_title_body(&md);
         let scroll = self.scroll.clone();
 
-        let theme_spec = self
-            .notes
-            .iter()
-            .find(|n| n.id == id)
-            .and_then(|n| n.theme.as_deref())
-            .map(|t| get_theme(Some(t)))
-            .unwrap_or(&THEMES[0]);
-        let is_dark = theme_spec.is_dark;
-
         let editor = cx.new(|cx| {
             let mut state = BlockEditorState::new(window, cx).with_source(&body);
             state.set_scroll_handle(scroll);
-            if is_dark {
-                state.set_editor_style(
-                    markdown_editor::BlockEditorStyle::default()
-                        .with_foreground(rgb(0xF3F4F6).into())
-                        .with_muted_foreground(rgb(0x9CA3AF).into())
-                        .with_caret(rgb(0xF3F4F6).into()),
-                    cx,
-                );
-            } else {
-                state.set_editor_style(
-                    markdown_editor::BlockEditorStyle::default()
-                        .with_foreground(rgb(0x1F2937).into())
-                        .with_muted_foreground(rgb(0x6B7280).into())
-                        .with_caret(rgb(0x2563EB).into()),
-                    cx,
-                );
-            }
+            state.set_editor_style(
+                markdown_editor::BlockEditorStyle::default()
+                    .with_foreground(rgb(0x232B36).into())
+                    .with_muted_foreground(rgb(0x6E7785).into())
+                    .with_caret(rgb(0x3B6EA8).into()),
+                cx,
+            );
             state
         });
         cx.subscribe_in(&editor, window, |this, _, event: &BlockEditorEvent, window, cx| {
@@ -784,8 +776,17 @@ impl AppState {
         }
         match self.sync.delete_note(id) {
             Ok(()) => {
+                // Remember the deletion so the remote `.md` goes away too;
+                // otherwise the next WebDAV pass would happily re-import the
+                // file as a "remote-only" note and resurrect what the user
+                // just deleted.
+                if self.config.webdav_configured() {
+                    self.webdav_deletions
+                        .record(&self.config.webdav, id, stickynotes_core::ticks::now_ticks());
+                }
                 self.status = SyncStatus::Saved("便签已删除".into());
                 self.reload(window, cx);
+                self.schedule_webdav_sync(window, cx);
             }
             Err(e) => {
                 self.status = SyncStatus::Error(format!("{e}"));
@@ -802,28 +803,6 @@ impl AppState {
                 self.refresh_db_sig();
                 if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
                     note.theme = Some(theme.to_string());
-                }
-                let is_dark = get_theme(Some(theme)).is_dark;
-                if let Some(editor) = &self.editor {
-                    editor.update(cx, |state, cx| {
-                        if is_dark {
-                            state.set_editor_style(
-                                markdown_editor::BlockEditorStyle::default()
-                                    .with_foreground(rgb(0xF3F4F6).into())
-                                    .with_muted_foreground(rgb(0x9CA3AF).into())
-                                    .with_caret(rgb(0xF3F4F6).into()),
-                                cx,
-                            );
-                        } else {
-                            state.set_editor_style(
-                                markdown_editor::BlockEditorStyle::default()
-                                    .with_foreground(rgb(0x1F2937).into())
-                                    .with_muted_foreground(rgb(0x6B7280).into())
-                                    .with_caret(rgb(0x2563EB).into()),
-                                cx,
-                            );
-                        }
-                    });
                 }
             }
             Err(e) => self.status = SyncStatus::Error(format!("{e}")),
@@ -1005,12 +984,16 @@ impl AppState {
                     if this
                         .update_in(cx, |this, window, cx| {
                             this.poll_external_changes(window, cx);
-                            // Background WebDAV pull, roughly once a minute.
-                            if this.poll_ticks % 30 == 0
-                                && this.config.webdav_auto
+                            // Background WebDAV pull. With the version cache a
+                            // quiet pass is a single PROPFIND per minute; when
+                            // the server is failing, the interval backs off so
+                            // it is not hammered. Local edits still upload via
+                            // the 2.5s debounce instead of waiting for this.
+                            if this.config.webdav_auto
                                 && !this.webdav_syncing
+                                && Instant::now() >= this.webdav_next_try
                             {
-                                this.start_webdav_sync(window, cx);
+                                this.start_webdav_sync(window, cx, false);
                             }
                         })
                         .is_err()
@@ -1067,6 +1050,7 @@ impl AppState {
 
     /// Copy the form back into the config and persist it.
     fn persist_settings(&mut self, cx: &App) {
+        let before = self.config.webdav.clone();
         if let Some(s) = &self.settings {
             self.config.webdav.url = s.url.read(cx).value().trim().to_string();
             self.config.webdav.username = s.user.read(cx).value().trim().to_string();
@@ -1077,6 +1061,19 @@ impl AppState {
             } else {
                 dir
             };
+        }
+        let target_changed = before.url != self.config.webdav.url
+            || before.username != self.config.webdav.username
+            || before.password != self.config.webdav.password
+            || before.dir != self.config.webdav.dir;
+        if target_changed {
+            // The version cache and the "directory exists" assumption belong
+            // to the old server/credentials.
+            self.webdav_cache = webdav::SyncCache::default();
+            self.webdav_deletions = webdav::DeleteLedger::default();
+            self.webdav_dir_ready = false;
+            self.webdav_failures = 0;
+            self.webdav_next_try = Instant::now();
         }
         if let Err(e) = self.config.save() {
             self.status = SyncStatus::Error(format!("保存设置失败：{e}"));
@@ -1094,6 +1091,11 @@ impl AppState {
     pub fn set_webdav_auto(&mut self, on: bool, cx: &mut Context<Self>) {
         self.config.webdav_auto = on;
         let _ = self.config.save();
+        if on {
+            // Try soon instead of waiting out a backoff from while it was off.
+            self.webdav_failures = 0;
+            self.webdav_next_try = Instant::now();
+        }
         cx.notify();
     }
 
@@ -1137,9 +1139,19 @@ impl AppState {
             .detach();
     }
 
-    /// One full WebDAV sync in the background. Silent when not configured.
-    pub fn start_webdav_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// One WebDAV sync in the background. Silent when not configured.
+    ///
+    /// `force` ignores the version cache and re-creates the collection; the
+    /// manual “立即同步” button uses it.
+    pub fn start_webdav_sync(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        force: bool,
+    ) {
         if self.webdav_syncing {
+            // Coalesce: run one more pass when the current one finishes.
+            self.webdav_pending = true;
             return;
         }
         if self.show_settings {
@@ -1153,13 +1165,30 @@ impl AppState {
             return;
         }
 
+        // The cache only applies to the server/directory it was built for.
+        if !self.webdav_cache.matches(&self.config.webdav) {
+            self.webdav_cache = webdav::SyncCache::default();
+            self.webdav_dir_ready = false;
+        }
+        if !self.webdav_deletions.matches(&self.config.webdav) {
+            self.webdav_deletions = webdav::DeleteLedger::default();
+        }
+
         // Make sure the note being edited is on disk before we snapshot.
         self.flush_pending_save(cx);
 
         self.webdav_syncing = true;
+        self.webdav_pending = false;
         self.webdav_message = Some("正在同步…".into());
         let cfg = self.config.webdav.clone();
         let notes = self.local_sync_notes(cx);
+        let cache = if force {
+            webdav::SyncCache::default()
+        } else {
+            self.webdav_cache.clone()
+        };
+        let ensure_dir = force || !self.webdav_dir_ready;
+        let ledger = self.webdav_deletions.clone();
         let this = cx.weak_entity();
         cx.notify();
 
@@ -1167,7 +1196,10 @@ impl AppState {
             .spawn(cx, async move |cx: &mut AsyncWindowContext| {
                 let result = cx
                     .background_executor()
-                    .spawn(async move { webdav::sync(&cfg, &notes) })
+                    .spawn(async move {
+                        let mut ledger = ledger;
+                        webdav::sync(&cfg, &notes, &cache, ensure_dir, &mut ledger)
+                    })
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.finish_webdav_sync(result, window, cx);
@@ -1191,7 +1223,7 @@ impl AppState {
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| {
                     if this.webdav_epoch == epoch {
-                        this.start_webdav_sync(window, cx);
+                        this.start_webdav_sync(window, cx, false);
                     }
                 });
             })
@@ -1227,13 +1259,50 @@ impl AppState {
 
     fn finish_webdav_sync(
         &mut self,
-        result: Result<webdav::SyncReport, String>,
+        result: Result<webdav::SyncOutcome, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.webdav_syncing = false;
         match result {
-            Ok(report) => {
+            Ok(outcome) => {
+                self.webdav_cache = outcome.cache;
+                let _ = self.webdav_cache.save();
+                self.webdav_deletions = outcome.ledger;
+                let _ = self.webdav_deletions.save();
+                self.webdav_dir_ready = true;
+                self.webdav_failures = 0;
+                self.webdav_next_try = Instant::now() + Duration::from_secs(60);
+
+                let report = outcome.report;
+                if !report.deleted_local.is_empty() {
+                    // The file was removed on another device and this device
+                    // has no newer local edit: follow the deletion.
+                    for id in &report.deleted_local {
+                        let ok = self.sync.delete_note(id).is_ok();
+                        debug_log(&format!("webdav tombstone applied={} id={}", ok, short_id(id)));
+                        if ok {
+                            if self.selected_id.as_deref() == Some(id.as_str()) {
+                                self.selected_id = None;
+                                self.editor = None;
+                                self.title_input = None;
+                                self.last_saved_md = None;
+                                self.last_saved_plum = None;
+                            }
+                        }
+                    }
+                    let _ = self.tags.prune_orphans(
+                        &self.notes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+                    );
+                    // Refresh the list so the deleted notes disappear now.
+                    if let Ok(notes) = self.sync.reload() {
+                        self.notes = notes;
+                    }
+                    self.refresh_db_sig();
+                    self.reload_tags_cache();
+                    self.prune_tag_orphans();
+                    self.ensure_selection_after_filter(window, cx);
+                }
                 if !report.remote_notes.is_empty() {
                     // Save local edits first; the remote note then wins only
                     // where its `updated_at` is newer (decided by the sync).
@@ -1265,9 +1334,20 @@ impl AppState {
                 self.status = SyncStatus::Saved(summary);
             }
             Err(e) => {
+                self.webdav_failures = self.webdav_failures.saturating_add(1);
+                // 30s, 60s, 120s, 240s, 480s, then 10 minutes — a down or
+                // unreachable server is not retried every minute.
+                let shift = self.webdav_failures.saturating_sub(1).min(5);
+                let secs = (30u64 << shift).min(600);
+                self.webdav_next_try = Instant::now() + Duration::from_secs(secs);
                 self.webdav_message = Some(format!("同步失败：{e}"));
                 self.status = SyncStatus::Error(format!("WebDAV 同步失败：{e}"));
             }
+        }
+        if self.webdav_pending {
+            // Work arrived while this pass was running; pick it up soon.
+            self.webdav_pending = false;
+            self.schedule_webdav_sync(window, cx);
         }
         cx.notify();
     }

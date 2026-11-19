@@ -115,11 +115,18 @@ impl PlumStore {
 
     /// Update an existing note's text, returning the `UpdatedAt` value written.
     pub fn update_text(&self, id: &str, plum_text: &str) -> Result<i64> {
+        self.update_text_at(id, plum_text, None)
+    }
+
+    /// Update text with a caller-chosen `UpdatedAt` (WebDAV download keeps
+    /// the remote timestamp, otherwise every applied note would look
+    /// locally-newer and the two devices would re-upload it forever).
+    pub fn update_text_at(&self, id: &str, plum_text: &str, updated_at: Option<i64>) -> Result<i64> {
         backup::backup_if_needed(&self.path)?;
         let conn = self.conn_write()?;
-        let updated_at = ticks::now_ticks();
+        let updated_at = updated_at.unwrap_or_else(ticks::now_ticks);
         let changed = conn.execute(
-            "UPDATE Note SET Text = ?1, UpdatedAt = ?2 WHERE Id = ?3",
+            "UPDATE Note SET Text = ?1, UpdatedAt = ?2 WHERE Id = ?3 AND DeletedAt IS NULL",
             params![plum_text, updated_at, id],
         )?;
         if changed == 0 {
@@ -402,5 +409,87 @@ mod tests {
         assert!(PlumStore::fresh_change_key(Some("not base64!")).is_none());
         // "COOKIE" decodes fine but is not a 30-byte ChangeKey.
         assert!(PlumStore::fresh_change_key(Some("Q09PS0lF")).is_none());
+    }
+
+    /// A fake plum database with the exact Note-table shape the real one has,
+    /// so `update_text_at` can be tested without touching the user's data.
+    fn fake_plum() -> PlumStore {
+        let dir = std::env::temp_dir()
+            .join(format!("stickynotes-plum-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plum.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE Note (
+                 Text varchar, WindowPosition varchar, IsOpen integer,
+                 IsAlwaysOnTop integer, CreationNoteIdAnchor varchar, Theme varchar,
+                 IsFutureNote integer, RemoteId varchar, ChangeKey varchar,
+                 LastServerVersion varchar, RemoteSchemaVersion integer,
+                 IsRemoteDataInvalid integer, PendingInsightsScan integer,
+                 Type varchar, Id varchar primary key not null, ParentId varchar,
+                 CreatedAt bigint, DeletedAt bigint, UpdatedAt bigint);",
+        )
+        .unwrap();
+        let template = base64::engine::general_purpose::STANDARD.encode([0u8; 30]);
+        conn.execute(
+            "INSERT INTO Note (Id, ChangeKey, CreatedAt, UpdatedAt) \
+             VALUES ('id-1', ?1, 10, 10)",
+            params![template],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Note (Id, ChangeKey, CreatedAt, UpdatedAt, DeletedAt) \
+             VALUES ('id-dead', ?1, 10, 10, 10)",
+            params![template],
+        )
+        .unwrap();
+        PlumStore { path }
+    }
+
+    #[test]
+    fn update_text_at_keeps_the_given_timestamp() {
+        // Backup writes go to %LOCALAPPDATA%\stickynotes\backups; point that at
+        // a scratch dir so the test cannot touch the user's real backups.
+        let sandbox = std::env::temp_dir()
+            .join(format!("stickynotes-localappdata-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::env::set_var("LOCALAPPDATA", &sandbox);
+        let store = fake_plum();
+        let written = store
+            .update_text_at("id-1", "\\id=x new text", Some(638_000_000_000_000_000))
+            .unwrap();
+        assert_eq!(written, 638_000_000_000_000_000);
+
+        let conn = Connection::open(store.path()).unwrap();
+        let (text, updated): (String, i64) = conn
+            .query_row(
+                "SELECT Text, UpdatedAt FROM Note WHERE Id = 'id-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "\\id=x new text");
+        assert_eq!(updated, 638_000_000_000_000_000);
+    }
+
+    #[test]
+    fn update_text_at_stamps_now_when_omitted_and_refuses_tombstones() {
+        let sandbox = std::env::temp_dir()
+            .join(format!("stickynotes-localappdata-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::env::set_var("LOCALAPPDATA", &sandbox);
+        let store = fake_plum();
+        let before = crate::ticks::now_ticks();
+        let written = store.update_text_at("id-1", "\\id=x a", None).unwrap();
+        assert!(written >= before);
+
+        // Writing to a soft-deleted row must fail, not resurrect it.
+        let err = store.update_text_at("id-dead", "\\id=x zombie", Some(1)).unwrap_err();
+        assert!(matches!(err, PlumError::Other(_)));
+        let conn = Connection::open(store.path()).unwrap();
+        let text: Option<String> = conn
+            .query_row("SELECT Text FROM Note WHERE Id = 'id-dead'", [], |r| r.get(0))
+            .unwrap();
+        assert!(text.unwrap_or_default().is_empty());
     }
 }

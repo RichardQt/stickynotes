@@ -1,10 +1,10 @@
 use crate::state::{AppState, MdTip, SyncStatus, ThemeSpec, WebDavTest, THEMES};
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{h_flex, v_flex, ElementExt as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::Sizable as _;
-use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -19,80 +19,137 @@ use std::time::Duration;
 use stickynotes_core::store::model::NoteSummary;
 use stickynotes_core::ticks;
 
-const SIDEBAR_W: Pixels = px(220.);
-const LIST_PANE_W: Pixels = px(272.);
-const TITLEBAR_H: Pixels = px(40.);
+const SIDEBAR_W: Pixels = px(206.);
+const LIST_PANE_W: Pixels = px(266.);
+const TITLEBAR_H: Pixels = px(38.);
+
+/// Note title type size and the line box that holds it. The line box must
+/// clear the font's full ascent + descent (about 1.33em for the system UI
+/// and CJK fallback fonts), or the input clips the glyphs.
+const TITLE_TEXT_SIZE: Pixels = px(22.);
+const TITLE_LINE_H: Pixels = px(32.);
+/// Horizontal inset the markdown editor applies inside its own viewport.
+/// The title field and its rule share it so all three left edges line up.
+const EDITOR_TEXT_INSET: Rems = Rems(0.625);
 
 // =========================================================================
-// Tahoe / Liquid Glass Surface & Shadow Helpers (solid glass form)
+// Unified Shell & Tahoe Solid-Glass Tokens
 // =========================================================================
 
-/// Inner specular highlight rim for Tahoe solid glass form.
-fn specular_rim(is_dark: bool) -> BoxShadow {
+/// Outer window chrome (titlebar + sidebar), framing the inset workspace sheet.
+const SHELL_BG: u32 = 0xF2F4F7;
+/// Secondary surface inside the workspace sheet for the note-card list pane.
+const LIST_BG: u32 = 0xF7F8FA;
+/// Primary ink for chrome, cards, and dialogs.
+const INK_PRIMARY: u32 = 0x1F2937;
+/// Secondary ink for navigation labels and snippets.
+const INK_SECONDARY: u32 = 0x525E6F;
+/// Muted ink for counts, timestamps, and field labels.
+const INK_MUTED: u32 = 0x768293;
+/// Primary button slate fill and states.
+const PRIMARY_BTN: u32 = 0x243042;
+const PRIMARY_BTN_HOVER: u32 = 0x324158;
+const PRIMARY_BTN_ACTIVE: u32 = 0x1A2330;
+
+/// Translucent foreground hover fill on the neutral shell (Tahoe `fills.hover`).
+fn shell_hover() -> Hsla {
+    hsla(218. / 360., 0.24, 0.18, 0.055)
+}
+
+/// Translucent foreground press/active fill on the neutral shell (Tahoe `fills.active`).
+fn shell_active() -> Hsla {
+    hsla(218. / 360., 0.26, 0.18, 0.095)
+}
+
+/// Translucent structural divider on the neutral shell (Tahoe `fills.line`).
+fn shell_hairline() -> Hsla {
+    hsla(218. / 360., 0.20, 0.16, 0.065)
+}
+
+/// Ink overlay for the note's paper: translucent black, so one alpha ramp
+/// works on every paper colour and always lets it show through instead of
+/// painting an opaque grey block. Assumes a light paper, which every theme is.
+fn ink(alpha: f32) -> Hsla {
+    hsla(0., 0., 0., alpha)
+}
+
+/// Frosted capsule fill for the colour-swatch track sitting on note paper.
+fn swatch_track_bg() -> Hsla {
+    hsla(0., 0., 1., 0.78)
+}
+
+/// Inner specular highlight rim for Tahoe solid-glass surfaces.
+fn specular_rim(is_dark: bool, alpha_light: f32) -> BoxShadow {
     BoxShadow {
         inset: true,
-        color: hsla(0., 0., 1., if is_dark { 0.12 } else { 0.75 }),
+        color: hsla(0., 0., 1., if is_dark { 0.13 } else { alpha_light }),
         offset: point(px(0.), px(0.5)),
         blur_radius: px(0.),
         spread_radius: px(0.5),
     }
 }
 
-/// Fine hairline outer edge.
-fn hairline_edge(is_dark: bool) -> BoxShadow {
+/// Fine 0.5px outer edge replacing CSS-style 1px borders on raised controls.
+fn hairline_edge(is_dark: bool, alpha_light: f32) -> BoxShadow {
     BoxShadow {
         inset: false,
-        color: hsla(0., 0., 0., if is_dark { 0.40 } else { 0.07 }),
+        color: hsla(0., 0., 0., if is_dark { 0.42 } else { alpha_light }),
         offset: point(px(0.), px(0.)),
         blur_radius: px(0.),
         spread_radius: px(0.5),
     }
 }
 
-/// Multi-layered surface shadow with specular rim, fine edge, and soft depth.
-fn surface_shadow(is_dark: bool, elevated: bool) -> Vec<BoxShadow> {
-    let depth_alpha = if is_dark { 0.32 } else { 0.07 };
-    let (y, blur, spread) = if elevated {
-        (px(5.), px(10.), px(-2.))
-    } else {
-        (px(1.5), px(3.), px(0.))
-    };
+/// Subtle frame around the inset workspace sheet (`note-list` + `editor-pane`).
+fn workspace_sheet_shadow() -> Vec<BoxShadow> {
     vec![
-        specular_rim(is_dark),
-        hairline_edge(is_dark),
+        hairline_edge(false, 0.07),
         BoxShadow {
             inset: false,
-            color: hsla(0., 0., 0., depth_alpha),
-            offset: point(px(0.), y),
-            blur_radius: blur,
-            spread_radius: spread,
+            color: hsla(220. / 360., 0.25, 0.12, 0.05),
+            offset: point(px(0.), px(2.)),
+            blur_radius: px(8.),
+            spread_radius: px(-1.),
         },
     ]
 }
 
-/// Capsule button edge for Tahoe geometry (inner top rim, fine edge, contact shadow).
-fn capsule_control_edge(is_dark: bool) -> Vec<BoxShadow> {
-    let rim = if is_dark { 0.14 } else { 0.45 };
-    let edge = if is_dark { 0.35 } else { 0.08 };
-    let contact = if is_dark { 0.25 } else { 0.08 };
+/// Lifted white pill for the active sidebar navigation item.
+fn nav_pill_shadow() -> Vec<BoxShadow> {
+    vec![
+        specular_rim(false, 0.85),
+        hairline_edge(false, 0.06),
+        BoxShadow {
+            inset: false,
+            color: hsla(220. / 360., 0.22, 0.14, 0.055),
+            offset: point(px(0.), px(1.)),
+            blur_radius: px(2.5),
+            spread_radius: px(0.),
+        },
+    ]
+}
+
+/// Capsule / input edge for Tahoe geometry (inner top rim, fine edge, contact shadow).
+/// Never pair with `.border_1()` — this edge replaces the border cleanly.
+fn capsule_control_edge() -> Vec<BoxShadow> {
     vec![
         BoxShadow {
             inset: true,
-            color: hsla(0., 0., 1., rim),
+            color: hsla(0., 0., 1., 0.55),
             offset: point(px(0.), px(1.)),
             blur_radius: px(0.),
             spread_radius: px(0.),
         },
         BoxShadow {
             inset: false,
-            color: hsla(0., 0., 0., edge),
+            color: hsla(0., 0., 0., 0.075),
             offset: point(px(0.), px(0.)),
             blur_radius: px(0.),
             spread_radius: px(0.5),
         },
         BoxShadow {
             inset: false,
-            color: hsla(0., 0., 0., contact),
+            color: hsla(0., 0., 0., 0.055),
             offset: point(px(0.), px(1.)),
             blur_radius: px(2.),
             spread_radius: px(0.),
@@ -100,13 +157,57 @@ fn capsule_control_edge(is_dark: bool) -> Vec<BoxShadow> {
     ]
 }
 
+/// Unselected note card at rest: crisp 0.5px edge and whisper-light lift.
+fn card_rest_shadow() -> Vec<BoxShadow> {
+    vec![
+        specular_rim(false, 0.80),
+        hairline_edge(false, 0.055),
+        BoxShadow {
+            inset: false,
+            color: hsla(220. / 360., 0.20, 0.14, 0.035),
+            offset: point(px(0.), px(1.)),
+            blur_radius: px(2.5),
+            spread_radius: px(0.),
+        },
+    ]
+}
+
+/// Selected note card: pairs with `note_theme.border` (so no duplicate outer hairline).
+fn card_selected_shadow() -> Vec<BoxShadow> {
+    vec![
+        specular_rim(false, 0.65),
+        BoxShadow {
+            inset: false,
+            color: hsla(0., 0., 0., 0.075),
+            offset: point(px(0.), px(4.)),
+            blur_radius: px(12.),
+            spread_radius: px(-2.),
+        },
+    ]
+}
+
+/// Floating modal / popover surface (`gpui-liquid-glass` `SurfaceExt` solid form).
+fn modal_surface_shadow() -> Vec<BoxShadow> {
+    vec![
+        specular_rim(false, 0.88),
+        hairline_edge(false, 0.10),
+        BoxShadow {
+            inset: false,
+            color: hsla(220. / 360., 0.25, 0.08, 0.20),
+            offset: point(px(0.), px(14.)),
+            blur_radius: px(34.),
+            spread_radius: px(-4.),
+        },
+    ]
+}
+
 /// Soft drop shadow that lifts the selected swatch off the palette track.
 /// Selection is expressed by size + elevation only — no ring, no inner dot,
 /// no heavy dark circle.
-fn lifted_swatch_shadow(dark: bool) -> BoxShadow {
+fn lifted_swatch_shadow() -> BoxShadow {
     BoxShadow {
         inset: false,
-        color: hsla(0., 0., 0., if dark { 0.45 } else { 0.22 }),
+        color: hsla(0., 0., 0., 0.24),
         offset: point(px(0.), px(1.5)),
         blur_radius: px(3.),
         spread_radius: px(0.),
@@ -128,15 +229,35 @@ impl Render for AppState {
             .id("app-root")
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0xF7F8FA))
+            .bg(rgb(SHELL_BG))
             .child(self.render_titlebar(window, cx))
             .child(
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(window, cx))
-                    .child(self.render_note_list(window, cx))
-                    .child(self.render_editor_area(current_theme, window, cx)),
+                    // Inset rounded workspace sheet: frames the list + paper
+                    // cleanly inside the shell so no paper colour collides
+                    // with the neutral titlebar or window buttons.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .pr(px(8.))
+                            .pb(px(8.))
+                            .child(
+                                h_flex()
+                                    .id("workspace-sheet")
+                                    .size_full()
+                                    .rounded(px(12.))
+                                    .overflow_hidden()
+                                    .bg(rgb(LIST_BG))
+                                    .shadow(workspace_sheet_shadow())
+                                    .child(self.render_note_list(window, cx))
+                                    .child(self.render_editor_area(current_theme, window, cx)),
+                            ),
+                    ),
             )
             // Hover hint for the markdown bar, painted last so it floats over
             // the title below the toolbar.
@@ -145,33 +266,44 @@ impl Render for AppState {
     }
 }
 
-/// A single window control button drawn on the light titlebar.
-/// The OS handles the actual click via `window_control_area` hit testing.
-fn titlebar_control(id: &'static str, area: WindowControlArea, icon: IconName) -> impl IntoElement {
+/// A single window control button drawn on the shell titlebar.
+/// The OS handles the actual click via `window_control_area` hit testing;
+/// Close adopts Windows-standard red hover/press feedback.
+fn titlebar_control(
+    id: &'static str,
+    area: WindowControlArea,
+    icon: IconName,
+    is_close: bool,
+) -> impl IntoElement {
     div()
         .id(id)
-        .size(px(40.))
+        .group(id)
+        .w(px(44.))
+        .h(TITLEBAR_H)
         .flex()
         .items_center()
         .justify_center()
         .window_control_area(area)
-        .hover(|el| el.bg(rgb(0xE8EBF0)))
+        .map(|el| {
+            if is_close {
+                el.hover(|s| s.bg(rgb(0xE81123)))
+                    .active(|s| s.bg(rgb(0xC50F1F)))
+            } else {
+                el.hover(|s| s.bg(shell_hover()))
+                    .active(|s| s.bg(shell_active()))
+            }
+        })
         .child(
-            Icon::new(icon)
-                .size(px(14.))
-                .text_color(rgb(0x5A6472)),
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(INK_SECONDARY))
+                .when(is_close, |el| {
+                    el.group_hover(id, |s| s.text_color(rgb(0xFFFFFF)))
+                })
+                .child(Icon::new(icon).size(px(13.5))),
         )
-}
-
-/// Ink overlay for the note's paper: pure black on light papers, pure white on
-/// dark ones, so a single alpha ramp works on every note theme and always lets
-/// the paper colour show through instead of painting a fixed grey.
-fn ink(theme: &ThemeSpec, alpha: f32) -> Hsla {
-    if theme.is_dark {
-        hsla(0., 0., 1., alpha)
-    } else {
-        hsla(0., 0., 0., alpha)
-    }
 }
 
 /// Whether the caret sits in a list, and which kind: (bullet, ordered, task).
@@ -193,53 +325,63 @@ fn list_state(model: &BlockEditorModel) -> (bool, bool, bool) {
     (false, false, false)
 }
 
-/// One icon button of the markdown toolbar: a 26×26 transparent square that
-/// only ever paints black/white alpha, so it blends into any paper colour.
+/// One icon button of the markdown toolbar: a 24×24 transparent square that
+/// only ever paints translucent ink, so it blends into any paper colour.
 /// Its painted bounds are recorded so the hover hint can sit under it.
 fn md_tb_icon(
     id: &'static str,
     icon: AssetIconName,
     active: bool,
     enabled: bool,
-    theme: &'static ThemeSpec,
     bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let fg = if !enabled {
-        ink(theme, 0.24)
+        ink(0.24)
     } else if active {
-        ink(theme, 0.90)
+        ink(0.92)
     } else {
-        ink(theme, 0.58)
+        ink(0.58)
     };
-    let fg_hover = if active { ink(theme, 0.90) } else { ink(theme, 0.85) };
-    let bg_hover = if active { ink(theme, 0.09) } else { ink(theme, 0.05) };
-    let bg_active = ink(theme, 0.09);
+    let fg_hover = if active {
+        ink(0.94)
+    } else {
+        ink(0.86)
+    };
+    let bg_hover = if active {
+        ink(0.11)
+    } else {
+        ink(0.06)
+    };
+    let bg_press = ink(0.15);
+    let bg_active = ink(0.10);
 
     div()
         .id(id)
         .group(id)
-        .size(px(26.))
+        .size(px(24.))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(5.))
+        .rounded(px(6.))
         .text_color(fg)
         .when(active, |el| el.bg(bg_active))
         .when(enabled, |el| {
-            el.cursor_pointer().hover(move |el| el.bg(bg_hover))
+            el.cursor_pointer()
+                .hover(move |s| s.bg(bg_hover))
+                .active(move |s| s.bg(bg_press))
         })
-        // The icon inherits the text colour, so hover only has to lift the
-        // wrapper's text colour — no second icon element or colour plumbing.
         .child(
             div()
                 .flex()
                 .items_center()
                 .justify_center()
-                .group_hover(id, move |el| el.text_color(fg_hover))
-                .child(Icon::new(icon).size(px(15.))),
+                .when(enabled, |el| {
+                    el.group_hover(id, move |s| s.text_color(fg_hover))
+                })
+                .child(Icon::new(icon).size(px(14.5))),
         )
         .on_prepaint(move |b, _, _| {
             bounds.borrow_mut().insert(id, b);
@@ -252,7 +394,7 @@ fn md_tb_icon(
         })
 }
 
-/// The dark capsule hint shown under a toolbar button.
+/// Tahoe solid-surface hint shown under a markdown toolbar button.
 fn md_tip_overlay(tip: MdTip) -> impl IntoElement {
     h_flex()
         .absolute()
@@ -260,43 +402,58 @@ fn md_tip_overlay(tip: MdTip) -> impl IntoElement {
         .top(tip.y + px(6.))
         .items_center()
         .gap(px(6.))
-        .px(px(8.))
-        .py(px(4.))
-        .rounded(px(5.))
-        .bg(rgb(0x1F2329))
-        .shadow(vec![BoxShadow {
-            inset: false,
-            color: hsla(0., 0., 0., 0.15),
-            offset: point(px(0.), px(4.)),
-            blur_radius: px(12.),
-            spread_radius: px(0.),
-        }])
+        .px(px(9.))
+        .py(px(4.5))
+        .rounded(px(8.))
+        .bg(rgb(0x1E232B))
+        .shadow(vec![
+            specular_rim(true, 0.14),
+            hairline_edge(true, 0.45),
+            BoxShadow {
+                inset: false,
+                color: hsla(0., 0., 0., 0.22),
+                offset: point(px(0.), px(6.)),
+                blur_radius: px(14.),
+                spread_radius: px(-2.),
+            },
+        ])
         .child(
             Label::new(tip.label)
                 .text_size(px(11.5))
-                .text_color(rgb(0xFFFFFF)),
+                .text_color(rgb(0xF8FAFC)),
         )
         .when(!tip.keys.is_empty(), |el| {
             el.child(
-                Label::new(tip.keys)
-                    .text_size(px(11.5))
-                    .text_color(hsla(0., 0., 1., 0.55)),
+                div()
+                    .px(px(4.5))
+                    .py(px(0.5))
+                    .rounded(px(4.))
+                    .bg(hsla(0., 0., 1., 0.11))
+                    .child(
+                        Label::new(tip.keys)
+                            .text_size(px(10.5))
+                            .text_color(hsla(0., 0., 1., 0.72)),
+                    ),
             )
         })
 }
 
 impl AppState {
     // =========================================================================
-    // 0. Immersive light titlebar (merged with the app surface)
+    // 0. Immersive shell titlebar (merged seamlessly with sidebar & frame)
     // =========================================================================
-    fn render_titlebar(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         h_flex()
             .id("app-titlebar")
             .w_full()
             .h(TITLEBAR_H)
             .flex_none()
             .items_center()
-            .bg(rgb(0xF7F8FA))
+            .bg(rgb(SHELL_BG))
             // The drag area must NOT cover the window buttons. Its hitbox is
             // painted before its children and the platform picks the first
             // window-control hitbox under the cursor, so a full-width Drag
@@ -306,65 +463,86 @@ impl AppState {
                     .id("titlebar-drag-region")
                     .flex_1()
                     .h_full()
-                    .pl(px(12.))
+                    .pl(px(14.))
                     .items_center()
-                    .gap_1p5()
+                    .gap_2()
                     .window_control_area(WindowControlArea::Drag)
                     .child(
                         div()
-                            .size(px(10.))
-                            .rounded(px(2.5))
-                            .bg(rgb(0xF5B84C))
-                            .shadow(capsule_control_edge(false)),
+                            .size(px(12.))
+                            .rounded(px(3.5))
+                            .bg(rgb(0xF0B443))
+                            .shadow(capsule_control_edge()),
                     )
                     .child(
                         Label::new("便签")
-                            .text_size(px(12.))
+                            .text_size(px(12.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x3D4756)),
-                    )
-                    .child(
-                        Label::new("Sticky Notes")
-                            .text_size(px(10.5))
-                            .text_color(rgb(0x9AA3B2)),
+                            .text_color(rgb(INK_PRIMARY)),
                     ),
             )
             .child(
                 h_flex()
                     .items_center()
                     .flex_none()
-                    .child(titlebar_control("tb-min", WindowControlArea::Min, IconName::WindowMinimize))
-                    .child(titlebar_control("tb-max", WindowControlArea::Max, IconName::WindowMaximize))
-                    .child(titlebar_control("tb-close", WindowControlArea::Close, IconName::WindowClose)),
+                    .child(titlebar_control(
+                        "tb-min",
+                        WindowControlArea::Min,
+                        IconName::WindowMinimize,
+                        false,
+                    ))
+                    .child(titlebar_control(
+                        "tb-max",
+                        WindowControlArea::Max,
+                        IconName::WindowMaximize,
+                        false,
+                    ))
+                    .child(titlebar_control(
+                        "tb-close",
+                        WindowControlArea::Close,
+                        IconName::WindowClose,
+                        true,
+                    )),
             )
     }
 
     // =========================================================================
     // 1. Left Navigation Sidebar
     // =========================================================================
-    fn render_sidebar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let all_count = self.notes.len() as u32;
 
-        // --- Tahoe Capsule "New Note" Button ---
+        // --- Tahoe Capsule "New Note" Button (optically aligned with 46px workspace header) ---
         let new_button = div()
             .px_3()
-            .pb_2p5()
+            .pt(px(7.))
+            .pb_2()
             .child(
                 h_flex()
                     .id("btn-new-note")
                     .w_full()
-                    .h(px(34.))
-                    .px_4()
+                    .h(px(32.))
+                    .px_3p5()
                     .items_center()
                     .justify_center()
-                    .gap_2()
+                    .gap_1p5()
                     .rounded(px(9999.))
-                    .bg(rgb(0x334155))
-                    .hover(|el| el.bg(rgb(0x475569)))
-                    .shadow(capsule_control_edge(false))
+                    .bg(rgb(PRIMARY_BTN))
+                    .hover(|el| el.bg(rgb(PRIMARY_BTN_HOVER)))
+                    .active(|el| el.bg(rgb(PRIMARY_BTN_ACTIVE)))
+                    .shadow(capsule_control_edge())
                     .cursor_pointer()
                     .child(
-                        Label::new("＋  新建便签")
+                        Icon::new(IconName::Plus)
+                            .size(px(13.5))
+                            .text_color(rgb(0xFFFFFF)),
+                    )
+                    .child(
+                        Label::new("新建便签")
                             .text_size(px(12.5))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(0xFFFFFF)),
@@ -375,23 +553,26 @@ impl AppState {
             );
 
         // --- Navigation Items (All Notes + Tags) ---
-        let mut nav_rows = v_flex().px_2().py_1().gap(px(2.));
+        let mut nav_rows = v_flex().px_2p5().py_0p5().gap(px(2.));
 
         // "All Notes" item
         let is_all_selected = self.tag_filter.is_none();
         nav_rows = nav_rows.child(
             h_flex()
                 .id("nav-all")
-                .px_3()
-                .py_2()
+                .h(px(32.))
+                .px_2p5()
                 .rounded(px(8.))
                 .items_center()
                 .justify_between()
                 .cursor_pointer()
                 .when(is_all_selected, |el| {
-                    el.bg(rgb(0xEAEFF6))
+                    el.bg(rgb(0xFFFFFF)).shadow(nav_pill_shadow())
                 })
-                .when(!is_all_selected, |el| el.hover(|el| el.bg(rgb(0xF0F2F5))))
+                .when(!is_all_selected, |el| {
+                    el.hover(|s| s.bg(shell_hover()))
+                        .active(|s| s.bg(shell_active()))
+                })
                 .child(
                     h_flex()
                         .items_center()
@@ -400,9 +581,9 @@ impl AppState {
                             Icon::new(IconName::Inbox)
                                 .size(px(14.))
                                 .text_color(if is_all_selected {
-                                    rgb(0x5B7A9D)
+                                    rgb(0x3B6EA8)
                                 } else {
-                                    rgb(0x8B94A3)
+                                    rgb(INK_MUTED)
                                 }),
                         )
                         .child(
@@ -414,9 +595,9 @@ impl AppState {
                                     FontWeight::NORMAL
                                 })
                                 .text_color(if is_all_selected {
-                                    rgb(0x3D5166)
+                                    rgb(INK_PRIMARY)
                                 } else {
-                                    rgb(0x3D4756)
+                                    rgb(INK_SECONDARY)
                                 }),
                         ),
                 )
@@ -426,18 +607,18 @@ impl AppState {
                         .py(px(1.))
                         .rounded_full()
                         .bg(if is_all_selected {
-                            rgb(0xD9E2EC)
+                            hsla(214. / 360., 0.45, 0.45, 0.11)
                         } else {
-                            rgb(0xE9EDF2)
+                            shell_hover()
                         })
                         .child(
                             Label::new(format!("{all_count}"))
                                 .text_size(px(10.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(if is_all_selected {
-                                    rgb(0x5B7A9D)
+                                    rgb(0x3B6EA8)
                                 } else {
-                                    rgb(0x8B94A3)
+                                    rgb(INK_MUTED)
                                 }),
                         ),
                 )
@@ -450,8 +631,9 @@ impl AppState {
 
         // "Tags" Section Header with Dedicated "+" Button
         let tags_header = h_flex()
-            .px_3()
-            .pt_3()
+            .pl_2p5()
+            .pr_1p5()
+            .pt_3p5()
             .pb_1()
             .items_center()
             .justify_between()
@@ -459,22 +641,23 @@ impl AppState {
                 Label::new("标签分类")
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x8B94A3)),
+                    .text_color(rgb(INK_MUTED)),
             )
             .child(
                 div()
                     .id("btn-toggle-sidebar-add-tag")
-                    .size(px(19.))
+                    .size(px(22.))
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded_full()
                     .cursor_pointer()
-                    .hover(|el| el.bg(rgb(0xE4E8EE)))
+                    .hover(|el| el.bg(shell_hover()))
+                    .active(|el| el.bg(shell_active()))
                     .child(
                         Icon::new(IconName::Plus)
-                            .size(px(11.5))
-                            .text_color(rgb(0x6B7480)),
+                            .size(px(12.))
+                            .text_color(rgb(INK_SECONDARY)),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_sidebar_add_tag(window, cx);
@@ -486,29 +669,23 @@ impl AppState {
         if self.show_sidebar_add_tag {
             if let Some(inp) = &self.new_tag_input {
                 let inline_add_row = h_flex()
-                    .mx_1()
                     .my_1()
                     .pl_2p5()
                     .pr_1()
-                    .h(px(32.))
+                    .h(px(31.))
                     .gap_1()
                     .items_center()
-                    .rounded(px(9.))
+                    .rounded(px(8.5))
                     .bg(rgb(0xFFFFFF))
-                    .border_1()
-                    .border_color(rgb(0xE4E8EE))
-                    .shadow(surface_shadow(false, false))
+                    .shadow(capsule_control_edge())
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                Input::new(inp)
-                                    .xsmall()
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .focus_bordered(false),
-                            ),
+                        div().flex_1().min_w_0().child(
+                            Input::new(inp)
+                                .xsmall()
+                                .appearance(false)
+                                .bordered(false)
+                                .focus_bordered(false),
+                        ),
                     )
                     .child(
                         div()
@@ -518,13 +695,14 @@ impl AppState {
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .bg(rgb(0xE7EEF6))
-                            .hover(|el| el.bg(rgb(0xD5E2F0)))
+                            .bg(hsla(214. / 360., 0.45, 0.45, 0.12))
+                            .hover(|el| el.bg(hsla(214. / 360., 0.45, 0.45, 0.20)))
+                            .active(|el| el.bg(hsla(214. / 360., 0.45, 0.45, 0.28)))
                             .cursor_pointer()
                             .child(
                                 Icon::new(IconName::Check)
                                     .size(px(11.))
-                                    .text_color(rgb(0x4A6889)),
+                                    .text_color(rgb(0x3B6EA8)),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.add_tag(window, cx);
@@ -538,12 +716,13 @@ impl AppState {
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .hover(|el| el.bg(rgb(0xF0F2F5)))
+                            .hover(|el| el.bg(shell_hover()))
+                            .active(|el| el.bg(shell_active()))
                             .cursor_pointer()
                             .child(
                                 Icon::new(IconName::Close)
                                     .size(px(10.))
-                                    .text_color(rgb(0x9AA3B2)),
+                                    .text_color(rgb(INK_MUTED)),
                             )
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.show_sidebar_add_tag = false;
@@ -557,14 +736,11 @@ impl AppState {
         // User Tags list (Zero SQLite queries - in-memory cache)
         if self.tags_list.is_empty() && !self.show_sidebar_add_tag {
             nav_rows = nav_rows.child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .child(
-                        Label::new("暂无标签，点击 ＋ 创建")
-                            .text_size(px(11.))
-                            .text_color(rgb(0x9AA3B2)),
-                    ),
+                div().px_2p5().py_2().child(
+                    Label::new("暂无标签，点击 ＋ 创建")
+                        .text_size(px(11.))
+                        .text_color(rgb(INK_MUTED)),
+                ),
             );
         }
 
@@ -574,74 +750,103 @@ impl AppState {
             let is_selected = self.tag_filter == Some(tid);
             // Unique group per row so the delete button only fades in for the
             // row the pointer is actually over.
-            let row_group = format!("tag-row-{tid}");
+            let row_group = SharedString::from(format!("tag-row-{tid}"));
 
             nav_rows = nav_rows.child(
                 h_flex()
                     .id(ElementId::Name(format!("nav-tag-{tid}").into()))
                     .group(row_group.clone())
-                    .h(px(30.))
-                    .px_3()
+                    .h(px(31.))
+                    .px_2p5()
                     .rounded(px(8.))
                     .items_center()
                     .justify_between()
                     .cursor_pointer()
                     .when(is_selected, |el| {
-                        el.bg(rgb(0xEAEFF6))
+                        el.bg(rgb(0xFFFFFF)).shadow(nav_pill_shadow())
                     })
-                    .when(!is_selected, |el| el.hover(|el| el.bg(rgb(0xF0F2F5))))
+                    .when(!is_selected, |el| {
+                        el.hover(|s| s.bg(shell_hover()))
+                            .active(|s| s.bg(shell_active()))
+                    })
                     .child(
                         h_flex()
                             .items_center()
+                            .gap_2()
                             .min_w_0()
                             .child(
-                                Label::new("#")
-                                    .text_size(px(11.5))
-                                    .text_color(if is_selected {
-                                        rgb(0x7E93A8)
-                                    } else {
-                                        rgb(0x9AA3B2)
-                                    }),
+                                div()
+                                    .w(px(14.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(AssetIconName::Hash)
+                                            .size(px(12.5))
+                                            .text_color(if is_selected {
+                                                rgb(0x3B6EA8)
+                                            } else {
+                                                rgb(INK_MUTED)
+                                            }),
+                                    ),
                             )
                             .child(
                                 Label::new(t.name.clone())
-                                    .text_size(px(12.))
+                                    .text_size(px(12.5))
+                                    .font_weight(if is_selected {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
                                     .truncate()
                                     .text_color(if is_selected {
-                                        rgb(0x3D5166)
+                                        rgb(INK_PRIMARY)
                                     } else {
-                                        rgb(0x556070)
+                                        rgb(INK_SECONDARY)
                                     }),
                             ),
                     )
                     .child(
-                        h_flex()
+                        // Count badge aligns flush right with "全部便签"; hovering
+                        // swaps it in-place for the delete button with zero layout shift.
+                        div()
+                            .relative()
+                            .h(px(20.))
+                            .min_w(px(22.))
+                            .flex_none()
+                            .flex()
                             .items_center()
-                            .gap_1()
+                            .justify_end()
                             .child(
                                 div()
-                                    .px_1p5()
-                                    .py(px(0.5))
+                                    .px_2()
+                                    .py(px(1.))
                                     .rounded_full()
                                     .bg(if is_selected {
-                                        rgb(0xD9E2EC)
+                                        hsla(214. / 360., 0.45, 0.45, 0.11)
                                     } else {
-                                        rgb(0xEDF0F4)
+                                        shell_hover()
                                     })
+                                    .group_hover(row_group.clone(), |el| el.opacity(0.))
                                     .child(
                                         Label::new(format!("{count}"))
-                                            .text_size(px(10.))
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::MEDIUM)
                                             .text_color(if is_selected {
-                                                rgb(0x5B7A9D)
+                                                rgb(0x3B6EA8)
                                             } else {
-                                                rgb(0x8B94A3)
+                                                rgb(INK_MUTED)
                                             }),
                                     ),
                             )
                             .child(
                                 div()
                                     .id(ElementId::Name(format!("del-tag-{tid}").into()))
-                                    .size(px(18.))
+                                    .absolute()
+                                    .right_0()
+                                    .top_0()
+                                    .size(px(20.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -649,11 +854,12 @@ impl AppState {
                                     .cursor_pointer()
                                     .opacity(0.)
                                     .group_hover(row_group, |el| el.opacity(1.))
-                                    .hover(|el| el.bg(rgb(0xF6E3E7)))
+                                    .hover(|el| el.bg(hsla(352. / 360., 0.65, 0.55, 0.14)))
+                                    .active(|el| el.bg(hsla(352. / 360., 0.65, 0.55, 0.24)))
                                     .child(
                                         Icon::new(IconName::Close)
-                                            .size(px(10.))
-                                            .text_color(rgb(0xB98A94)),
+                                            .size(px(9.5))
+                                            .text_color(rgb(0xB45B67)),
                                     )
                                     .on_click(cx.listener(move |this, _, _window, cx| {
                                         this.delete_tag(tid, cx);
@@ -670,54 +876,55 @@ impl AppState {
 
         let webdav_configured = self.config.webdav_configured();
         let webdav_on = self.config.webdav_auto && webdav_configured;
-        let (dot, webdav_label) = if webdav_on {
-            (0x74B58B, "WebDAV 自动同步")
+        let (dot, webdav_label) = if self.webdav_syncing {
+            (0x4F86C6, "WebDAV 正在同步…")
+        } else if webdav_on {
+            (0x52A876, "WebDAV 自动同步")
         } else if webdav_configured {
-            (0xD8A24A, "WebDAV 已配置")
+            (0xD49B3E, "WebDAV 已配置")
         } else {
-            (0xBFC6D1, "WebDAV 未配置")
+            (0xAAB3C0, "WebDAV 未配置")
         };
-        let footer_status = h_flex()
-            .px_3()
-            .py_2p5()
-            .border_t_1()
-            .border_color(rgb(0xE7EAF0))
-            .items_center()
-            .gap_2()
-            .justify_between()
+
+        let footer_status = div()
+            .px_2p5()
+            .pb(px(8.))
+            .pt_1()
             .child(
                 h_flex()
+                    .id("btn-settings")
+                    .h(px(32.))
+                    .px_2p5()
+                    .rounded(px(8.))
                     .items_center()
                     .gap_2()
-                    .min_w_0()
+                    .justify_between()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(shell_hover()))
+                    .active(|el| el.bg(shell_active()))
                     .child(
-                        div()
-                            .size(px(7.))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(rgb(dot)),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .size(px(6.5))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(rgb(dot)),
+                            )
+                            .child(
+                                Label::new(webdav_label)
+                                    .text_size(px(11.))
+                                    .text_color(rgb(INK_SECONDARY)),
+                            ),
                     )
                     .child(
-                        Label::new(webdav_label)
-                            .text_size(px(10.5))
-                            .text_color(rgb(0x8B94A3)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("btn-settings")
-                    .size(px(24.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|el| el.bg(rgb(0xEDF0F4)))
-                    .child(
                         Icon::new(AssetIconName::Settings)
-                            .size(px(14.))
-                            .text_color(rgb(0x6B7480)),
+                            .size(px(13.5))
+                            .flex_none()
+                            .text_color(rgb(INK_MUTED)),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_settings(window, cx);
@@ -729,9 +936,7 @@ impl AppState {
             .w(SIDEBAR_W)
             .h_full()
             .flex_none()
-            .bg(rgb(0xF7F8FA))
-            .border_r_1()
-            .border_color(rgb(0xE7EAF0))
+            .bg(rgb(SHELL_BG))
             .child(new_button)
             .child(
                 v_flex()
@@ -747,64 +952,62 @@ impl AppState {
     // =========================================================================
     // 2. Middle Note Cards List Pane
     // =========================================================================
-    fn render_note_list(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_note_list(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let notes = self.filtered_notes();
 
-        // Spotlight-style Search Bar at top of list
+        // Tahoe capsule search bar aligned to the same 46px header band as the editor bar
         let search_box = match &self.search_input {
             Some(inp) => h_flex()
-                .px_2p5()
-                .h(px(52.))
+                .h(px(46.))
+                .px_3()
                 .flex_none()
                 .items_center()
-                .bg(rgb(0xF7F8FA))
-                // Same height and hairline as the canvas palette bar, so the
-                // two dividers read as one continuous line across the panes.
-                .border_b_1()
-                .border_color(rgb(0xE7EAF0))
                 .child(
                     h_flex()
                         .w_full()
-                        .h(px(30.))
-                        .pl_2p5()
-                        .pr_1()
+                        .h(px(32.))
+                        .pl_3()
+                        .pr_1p5()
                         .gap_1p5()
                         .items_center()
-                        .rounded(px(15.))
+                        .rounded(px(9999.))
                         .bg(rgb(0xFFFFFF))
-                        .border_1()
-                        .border_color(rgb(0xE4E8EE))
-                        .shadow(surface_shadow(false, false))
+                        .shadow(capsule_control_edge())
                         .child(
                             Icon::new(IconName::Search)
-                                .size(px(13.))
-                                .text_color(rgb(0x9AA3B2)),
+                                .size(px(13.5))
+                                .flex_none()
+                                .text_color(rgb(INK_MUTED)),
                         )
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    Input::new(inp)
-                                        .appearance(false)
-                                        .focus_bordered(false),
-                                ),
+                            div().flex_1().min_w_0().child(
+                                Input::new(inp)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .focus_bordered(false),
+                            ),
                         )
                         .when(!self.search_query.is_empty(), |el| {
                             el.child(
                                 div()
                                     .id("btn-clear-search")
-                                    .size(px(16.))
+                                    .size(px(18.))
+                                    .flex_none()
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .rounded_full()
-                                    .hover(|s| s.bg(rgb(0xE9EDF2)))
+                                    .hover(|s| s.bg(shell_hover()))
+                                    .active(|s| s.bg(shell_active()))
                                     .cursor_pointer()
                                     .child(
                                         Icon::new(IconName::Close)
                                             .size(px(10.))
-                                            .text_color(rgb(0x8B94A3)),
+                                            .text_color(rgb(INK_MUTED)),
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.clear_search(window, cx);
@@ -818,15 +1021,18 @@ impl AppState {
 
         // Note Count & Filter Banner
         let active_tag_name = self.tag_filter.and_then(|tid| {
-            self.tags_list.iter().find(|t| t.id == tid).map(|t| t.name.clone())
+            self.tags_list
+                .iter()
+                .find(|t| t.id == tid)
+                .map(|t| t.name.clone())
         });
 
         let subheader = h_flex()
-            .px_3()
-            .py_1p5()
+            .px_3p5()
+            .py_1()
+            .flex_none()
             .items_center()
             .justify_between()
-            .bg(rgb(0xF7F8FA))
             .child(
                 h_flex()
                     .items_center()
@@ -834,35 +1040,31 @@ impl AppState {
                     .when_some(active_tag_name, |el, name| {
                         el.child(
                             h_flex()
-                                .px_1p5()
-                                .py(px(0.5))
+                                .id("btn-clear-tag-filter")
+                                .pl_2()
+                                .pr_1p5()
+                                .py(px(1.))
                                 .rounded_full()
-                                .bg(rgb(0xE3EAF2))
+                                .bg(hsla(214. / 360., 0.45, 0.45, 0.12))
+                                .hover(|s| s.bg(hsla(214. / 360., 0.45, 0.45, 0.18)))
+                                .active(|s| s.bg(hsla(214. / 360., 0.45, 0.45, 0.25)))
                                 .items_center()
                                 .gap_1()
+                                .cursor_pointer()
                                 .child(
                                     Label::new(format!("#{name}"))
                                         .text_size(px(10.5))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(0x5B7A9D)),
+                                        .text_color(rgb(0x3B6EA8)),
                                 )
                                 .child(
-                                    div()
-                                        .id("btn-clear-tag-filter")
-                                        .size(px(12.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .child(
-                                            Icon::new(IconName::Close)
-                                                .size(px(9.))
-                                                .text_color(rgb(0x5B7A9D)),
-                                        )
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.clear_tag_filter(window, cx);
-                                        })),
-                                ),
+                                    Icon::new(IconName::Close)
+                                        .size(px(9.))
+                                        .text_color(rgb(0x3B6EA8)),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.clear_tag_filter(window, cx);
+                                })),
                         )
                     })
                     .child(
@@ -872,12 +1074,12 @@ impl AppState {
                             format!("共 {} 条便签", notes.len())
                         })
                         .text_size(px(11.))
-                        .text_color(rgb(0x9AA3B2)),
+                        .text_color(rgb(INK_MUTED)),
                     ),
             );
 
         // Cards list
-        let mut card_list = v_flex().p_2().gap_1p5();
+        let mut card_list = v_flex().px_2p5().pt_1().pb_3().gap(px(6.));
         if notes.is_empty() {
             card_list = card_list.child(
                 v_flex()
@@ -887,28 +1089,46 @@ impl AppState {
                     .gap_2p5()
                     .child(
                         div()
-                            .size(px(36.))
+                            .size(px(38.))
                             .rounded(px(10.))
-                            .bg(rgb(0xE7EAF0))
+                            .bg(shell_hover())
                             .flex()
                             .flex_col()
                             .items_center()
                             .justify_center()
-                            .gap(px(2.5))
-                            .child(div().w(px(18.)).h(px(2.)).rounded_full().bg(rgb(0xB4BCC8)))
-                            .child(div().w(px(18.)).h(px(2.)).rounded_full().bg(rgb(0xC6CDD7)))
-                            .child(div().w(px(10.)).h(px(2.)).rounded_full().bg(rgb(0xD5DAE2))),
+                            .gap(px(3.))
+                            .child(
+                                div()
+                                    .w(px(18.))
+                                    .h(px(2.))
+                                    .rounded_full()
+                                    .bg(hsla(218. / 360., 0.20, 0.35, 0.35)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(18.))
+                                    .h(px(2.))
+                                    .rounded_full()
+                                    .bg(hsla(218. / 360., 0.20, 0.35, 0.25)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(11.))
+                                    .h(px(2.))
+                                    .rounded_full()
+                                    .bg(hsla(218. / 360., 0.20, 0.35, 0.18)),
+                            ),
                     )
                     .child(
                         Label::new("暂无匹配便签")
-                            .text_size(px(13.))
+                            .text_size(px(12.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(0x6B7480)),
+                            .text_color(rgb(INK_SECONDARY)),
                     )
                     .child(
-                        Label::new("点击左侧“＋ 新建便签”添加第一条笔记")
+                        Label::new("点击左侧“新建便签”添加第一条笔记")
                             .text_size(px(11.))
-                            .text_color(rgb(0x9AA3B2)),
+                            .text_color(rgb(INK_MUTED)),
                     ),
             );
         } else {
@@ -922,9 +1142,9 @@ impl AppState {
             .w(LIST_PANE_W)
             .h_full()
             .flex_none()
-            .bg(rgb(0xF1F3F6))
+            .bg(rgb(LIST_BG))
             .border_r_1()
-            .border_color(rgb(0xE7EAF0))
+            .border_color(shell_hairline())
             .child(search_box)
             .child(subheader)
             .child(
@@ -955,10 +1175,8 @@ impl AppState {
             .id(ElementId::Name(format!("note-card-{idx}").into()))
             .w_full()
             .pl_3()
-            // Slightly deeper right padding keeps the timestamp off the edge
-            // and gives truncated titles/snippets room to breathe.
-            .pr(px(14.))
-            .py(px(7.))
+            .pr(px(13.))
+            .py(px(8.5))
             .gap_2()
             .rounded(px(10.))
             .cursor_pointer();
@@ -968,23 +1186,19 @@ impl AppState {
                 .bg(rgb(note_theme.card_active_bg))
                 .border_1()
                 .border_color(rgb(note_theme.border))
-                .shadow(surface_shadow(note_theme.is_dark, true));
+                .shadow(card_selected_shadow());
         } else {
             card = card
                 .bg(rgb(0xFFFFFF))
-                .border_1()
-                .border_color(rgb(0xE7EAF0))
-                .shadow(surface_shadow(false, false))
-                .hover(|el| {
-                    el.bg(rgb(0xFCFDFE))
-                        .border_color(rgb(0xD9DEE6))
-                });
+                .shadow(card_rest_shadow())
+                .hover(|el| el.bg(rgb(0xFCFDFF)))
+                .active(|el| el.bg(rgb(0xF3F5F9)));
         }
 
         // Card body content
-        let mut content = v_flex().flex_1().min_w_0().gap(px(2.));
+        let mut content = v_flex().flex_1().min_w_0().gap(px(3.));
 
-        // Title row: theme color dot + Title + Relative Timestamp
+        // Title row: theme color dot + Title + Pin + Relative Timestamp
         let title_text = if note.title.trim().is_empty() {
             "(无标题便签)"
         } else {
@@ -996,7 +1210,7 @@ impl AppState {
             .gap_1p5()
             .child(
                 div()
-                    .size(px(7.))
+                    .size(px(7.5))
                     .flex_none()
                     .rounded_full()
                     .bg(rgb(note_theme.accent)),
@@ -1012,32 +1226,22 @@ impl AppState {
                     } else {
                         FontWeight::SEMIBOLD
                     })
-                    .text_color(if note_theme.is_dark && is_selected {
-                        rgb(0xF3F4F6)
-                    } else if is_selected {
-                        rgb(0x2B3442)
-                    } else {
-                        rgb(0x3D4756)
-                    })
+                    .text_color(rgb(INK_PRIMARY))
                     .child(title_text.to_string()),
             )
             .when(is_pinned, |el| {
                 el.child(
                     Icon::new(AssetIconName::Pin)
-                        .size(px(10.))
+                        .size(px(10.5))
                         .flex_none()
-                        .text_color(rgb(0x8B94A3)),
+                        .text_color(rgb(0x5B7A9D)),
                 )
             })
             .child(
                 Label::new(updated)
-                    .text_size(px(10.))
+                    .text_size(px(10.5))
                     .flex_none()
-                    .text_color(if note_theme.is_dark && is_selected {
-                        rgb(0x9AA3B2)
-                    } else {
-                        rgb(0x9AA3B2)
-                    }),
+                    .text_color(rgb(INK_MUTED)),
             );
         content = content.child(title_row);
 
@@ -1046,14 +1250,10 @@ impl AppState {
             content = content.child(
                 div()
                     .text_size(px(11.5))
-                    .line_height(px(17.))
+                    .line_height(px(16.5))
                     .line_clamp(2)
                     .text_ellipsis()
-                    .text_color(if note_theme.is_dark && is_selected {
-                        rgb(0xCBD5E1)
-                    } else {
-                        rgb(0x7B8494)
-                    })
+                    .text_color(rgb(0x647082))
                     .child(note.snippet.clone()),
             );
         }
@@ -1104,48 +1304,52 @@ impl AppState {
                 let id_tags = menu_note_id.clone();
                 let attached = attached.clone();
                 let all_tags = all_tags.clone();
-                menu = menu.submenu("添加 / 管理标签", window, cx, move |mut sub, _window, _cx| {
-                    if all_tags.is_empty() {
-                        sub = sub.item(PopupMenuItem::new("暂无标签，先在左侧新建").disabled(true));
-                    }
-                    for (tid, name) in all_tags.iter() {
-                        let tid = *tid;
+                menu = menu.submenu(
+                    "添加 / 管理标签",
+                    window,
+                    cx,
+                    move |mut sub, _window, _cx| {
+                        if all_tags.is_empty() {
+                            sub = sub.item(
+                                PopupMenuItem::new("暂无标签，先在左侧新建").disabled(true),
+                            );
+                        }
+                        for (tid, name) in all_tags.iter() {
+                            let tid = *tid;
+                            let weak = weak_tags.clone();
+                            let id = id_tags.clone();
+                            sub = sub.item(
+                                PopupMenuItem::new(format!("#{name}"))
+                                    .checked(attached.contains(&tid))
+                                    .on_click(move |_, _window, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.toggle_tag_for(&id, tid, cx);
+                                        });
+                                    }),
+                            );
+                        }
+                        sub = sub.separator();
                         let weak = weak_tags.clone();
                         let id = id_tags.clone();
-                        sub = sub.item(
-                            PopupMenuItem::new(format!("#{name}"))
-                                .checked(attached.contains(&tid))
+                        let handle = window_handle;
+                        sub.item(
+                            PopupMenuItem::new("新建标签…")
+                                .icon(Icon::new(IconName::Plus))
                                 .on_click(move |_, _window, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.toggle_tag_for(&id, tid, cx);
-                                    });
-                                }),
-                        );
-                    }
-                    sub = sub.separator();
-                    let weak = weak_tags.clone();
-                    let id = id_tags.clone();
-                    let handle = window_handle;
-                    sub.item(
-                        PopupMenuItem::new("新建标签…")
-                            .icon(Icon::new(IconName::Plus))
-                            .on_click(move |_, _window, cx| {
-                                let weak = weak.clone();
-                                let id = id.clone();
-                                // Menu callbacks only get `&mut App` and run while
-                                // the window is borrowed; defer, then go through
-                                // the window handle to reach a `&mut Window`.
-                                cx.defer(move |cx| {
-                                    let _ = handle.update(cx, |_, window, cx| {
-                                        let _ = weak.update(cx, |this, cx| {
-                                            this.select_note(&id, window, cx);
-                                            this.toggle_sidebar_add_tag(window, cx);
+                                    let weak = weak.clone();
+                                    let id = id.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = handle.update(cx, |_, window, cx| {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                this.select_note(&id, window, cx);
+                                                this.toggle_sidebar_add_tag(window, cx);
+                                            });
                                         });
                                     });
-                                });
-                            }),
-                    )
-                });
+                                }),
+                        )
+                    },
+                );
 
                 // 3. Delete this note (not necessarily the selected one).
                 let weak_del = weak.clone();
@@ -1170,16 +1374,43 @@ impl AppState {
     }
 
     // =========================================================================
-    // 3. Right Editor Canvas Area
+    // 3. Right Editor Paper Canvas Area
     // =========================================================================
 
-    /// Flat, single-row markdown bar: every high-frequency format is a 26×26
+    /// Unified single-row paper header: Markdown formatting strip on the left
+    /// and the frosted Tahoe colour-swatch capsule on the right, separated from
+    /// the note canvas by one delicate ink hairline.
+    fn render_editor_header(
+        &self,
+        editor: &Entity<BlockEditorState>,
+        theme: &'static ThemeSpec,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let md_strip = self.render_md_toolbar(editor, cx);
+        let palette = self.render_palette_capsule(theme, cx);
+
+        h_flex()
+            .id("canvas-toolbar")
+            .w_full()
+            .h(px(46.))
+            .flex_none()
+            .px_5()
+            .gap_3()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(ink(0.06))
+            .bg(rgb(theme.paper_bg))
+            .child(md_strip)
+            .child(palette)
+    }
+
+    /// Flat, single-row markdown bar: every high-frequency format is a 24×24
     /// icon button with a hover hint. No dropdowns and no fixed grey — the
     /// paper colour shows through every state.
     fn render_md_toolbar(
         &self,
         editor: &Entity<BlockEditorState>,
-        theme: &'static ThemeSpec,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (kind, in_text, in_code_block, bold, italic, strike, code, highlight, in_quote) = {
@@ -1203,21 +1434,15 @@ impl AppState {
             list_state(e.model())
         };
 
-        let heading = |level: u8| matches!(kind, Some(BlockKind::Heading { level: l }) if l == level);
-        // Headings and inline marks cannot apply inside a code block.
+        let heading =
+            |level: u8| matches!(kind, Some(BlockKind::Heading { level: l }) if l == level);
         let heading_enabled = in_text && !in_code_block;
         let marks_enabled = in_text && !in_code_block;
 
-        // Everything is a black (or white, on dark paper) alpha overlay: no
-        // fixed grey, so the bar picks up whatever paper colour is behind it.
-        let sep_bg = ink(theme, 0.08);
-        let divider = ink(theme, 0.06);
-
+        let sep_bg = ink(0.08);
         let app = cx.entity();
         let bounds = self.md_tip_bounds.clone();
 
-        // Hover hint: appears after a short rest, anchored under the button's
-        // painted bounds, and cleared as soon as the pointer leaves it.
         let hover_for = |id: &'static str, label: &'static str, keys: &'static str| {
             let app = app.clone();
             move |hovered: &bool, _window: &mut Window, cx: &mut App| {
@@ -1240,7 +1465,6 @@ impl AppState {
                             .timer(Duration::from_millis(350))
                             .await;
                         let _ = weak.update(cx, |this, cx| {
-                            // The pointer may have moved on while we waited.
                             if this.md_tip_hover != Some(id) {
                                 return;
                             }
@@ -1288,13 +1512,12 @@ impl AppState {
                 icon,
                 active,
                 enabled,
-                theme,
                 bounds.clone(),
                 hover_for(id, label, keys),
                 run(cmd),
             )
         };
-        let sep = || div().w(px(1.)).h(px(12.)).mx(px(3.)).flex_none().bg(sep_bg);
+        let sep = || div().w(px(1.)).h(px(12.)).mx(px(2.5)).flex_none().bg(sep_bg);
 
         let code_block_cmd = if in_code_block {
             EditorCommand::SetBlockKind(BlockKind::Paragraph)
@@ -1302,26 +1525,20 @@ impl AppState {
             EditorCommand::SetCodeBlock { lang: None }
         };
 
-        // Transparent 32px strip with a single 1px hairline underneath. It
-        // scrolls horizontally (scrollbar hidden) instead of wrapping when the
-        // pane gets narrow.
         div()
             .id("md-toolbar-scroll")
-            .w_full()
-            .h(px(32.))
-            .flex_none()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .overflow_x_scroll()
             .scrollbar_width(px(0.))
-            .border_b_1()
-            .border_color(divider)
             .child(
                 h_flex()
                     .h_full()
                     .flex_none()
                     .items_center()
-                    .gap(px(2.))
-                    // 1. Heading level. 正文 is a plain action, never shown as
-                    // selected — a normal paragraph is the default, not a mode.
+                    .gap(px(1.5))
+                    // 1. Heading level.
                     .child(btn(
                         "md-para",
                         AssetIconName::Pilcrow,
@@ -1473,80 +1690,68 @@ impl AppState {
             )
     }
 
+    /// Frosted Tahoe capsule holding the paper-theme swatches.
+    /// Selection is expressed purely by size + soft elevation — no outer ring,
+    /// no inner dot, and no dark circle.
+    fn render_palette_capsule(
+        &self,
+        current_theme: &'static ThemeSpec,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut palette = h_flex()
+            .h(px(26.))
+            .items_center()
+            .gap(px(4.5))
+            .px(px(7.))
+            .rounded(px(9999.))
+            .bg(swatch_track_bg())
+            .shadow(capsule_control_edge())
+            .flex_none();
+
+        for t in THEMES {
+            let theme_name = t.name.to_string();
+            let is_cur = t.name == current_theme.name;
+
+            let mut circle = div()
+                .id(ElementId::Name(format!("palette-{}", t.name).into()))
+                .size(if is_cur { px(15.) } else { px(12.) })
+                .flex_none()
+                .rounded_full()
+                .cursor_pointer()
+                .bg(rgb(t.accent));
+
+            if is_cur {
+                circle = circle.shadow(vec![lifted_swatch_shadow()]);
+            } else {
+                circle = circle
+                    .opacity(0.88)
+                    .hover(|s| s.opacity(1.).shadow(vec![lifted_swatch_shadow()]))
+                    .active(|s| s.opacity(0.75));
+            }
+
+            circle = circle.on_click(cx.listener(move |this, _, _window, cx| {
+                this.set_theme(&theme_name, cx);
+            }));
+
+            palette = palette.child(circle);
+        }
+
+        palette
+    }
+
     fn render_editor_area(
         &mut self,
         theme: &'static ThemeSpec,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let toolbar = self.render_canvas_toolbar(theme, cx);
-
-        let editor_content = match (&self.editor, &self.title_input) {
-            (Some(editor), Some(title_input)) => div()
-                .id("editor-canvas")
+        let Some((editor, title_input)) = self.editor.clone().zip(self.title_input.clone()) else {
+            return v_flex()
+                .id("editor-pane")
                 .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll)
-                .text_color(if theme.is_dark {
-                    rgb(0xF3F4F6)
-                } else {
-                    rgb(0x2B3442)
-                })
-                // Markdown formatting bar first, right under the palette bar.
-                // Its own 32px row with a single hairline underneath.
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(760.))
-                        .mx_auto()
-                        .px_6()
-                        .pt(px(6.))
-                        .child(self.render_md_toolbar(editor, theme, cx)),
-                )
-                // Title: a borderless single-line field, visually part of the page.
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(760.))
-                        .mx_auto()
-                        .px_6()
-                        .pt(px(14.))
-                        .pb(px(10.))
-                        .child(
-                            Input::new(title_input)
-                                .appearance(false)
-                                .bordered(false)
-                                .focus_bordered(false)
-                                .text_size(px(21.))
-                                .font_weight(FontWeight::SEMIBOLD),
-                        ),
-                )
-                // Hairline between title and body, same width as the toolbar's.
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(760.))
-                        .mx_auto()
-                        .px_6()
-                        .child(div().w_full().h(px(1.)).bg(ink(theme, 0.08))),
-                )
-                // Body: markdown editor, 14px below the divider.
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(760.))
-                        .mx_auto()
-                        .px_6()
-                        .pt(px(14.))
-                        .pb_5()
-                        .child(BlockEditor::new(editor).auto_grow(12, 60)),
-                )
-                .into_any_element(),
-            _ => div()
-                .flex_1()
-                .size_full()
-                .flex()
+                .min_w_0()
+                .h_full()
+                .bg(rgb(theme.paper_bg))
                 .items_center()
                 .justify_center()
                 .child(
@@ -1555,31 +1760,89 @@ impl AppState {
                         .gap_3()
                         .child(
                             div()
-                                .size(px(48.))
+                                .size(px(46.))
                                 .rounded(px(12.))
-                                .bg(rgb(0xE7EAF0))
+                                .bg(ink(0.05))
                                 .flex()
                                 .flex_col()
                                 .items_center()
                                 .justify_center()
-                                .gap(px(3.))
-                                .child(div().w(px(24.)).h(px(2.5)).rounded_full().bg(rgb(0xB4BCC8)))
-                                .child(div().w(px(24.)).h(px(2.5)).rounded_full().bg(rgb(0xC6CDD7)))
-                                .child(div().w(px(14.)).h(px(2.5)).rounded_full().bg(rgb(0xD5DAE2))),
+                                .gap(px(3.5))
+                                .child(div().w(px(22.)).h(px(2.5)).rounded_full().bg(ink(0.22)))
+                                .child(div().w(px(22.)).h(px(2.5)).rounded_full().bg(ink(0.16)))
+                                .child(div().w(px(13.)).h(px(2.5)).rounded_full().bg(ink(0.12))),
                         )
                         .child(
-                            Label::new("选择左侧便签，或点击“＋ 新建便签”")
-                                .text_size(px(14.))
+                            Label::new("选择左侧便签，或点击“新建便签”")
+                                .text_size(px(13.5))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(0x9AA3B2)),
+                                .text_color(ink(0.45)),
                         ),
-                )
-                .into_any_element(),
+                );
         };
 
-        // Footer left: the current note's tags, if it has any. Only error and
-        // busy states are surfaced as text, so one-off messages like
-        // “标签已删除” no longer linger under every note.
+        let header = self.render_editor_header(&editor, theme, cx);
+
+        let editor_content = div()
+            .id("editor-canvas")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .text_color(rgb(0x232B36))
+            // Title: borderless single-line field, visually part of the note sheet.
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(740.))
+                    .mx_auto()
+                    .px_8()
+                    .pt(px(22.))
+                    .pb(px(10.))
+                    .child(
+                        // The stock input frame is a 32px control with 8px of
+                        // vertical padding and a 20px line box, which clips
+                        // 22px glyphs. The frame hugs one full title line.
+                        Input::new(&title_input)
+                            .appearance(false)
+                            .bordered(false)
+                            .focus_bordered(false)
+                            .h(TITLE_LINE_H)
+                            .py_0()
+                            .px(EDITOR_TEXT_INSET)
+                            .line_height(TITLE_LINE_H)
+                            .text_size(TITLE_TEXT_SIZE)
+                            .font_weight(FontWeight::BOLD),
+                    ),
+            )
+            // Delicate ink rule separating the note title from the markdown body.
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(740.))
+                    .mx_auto()
+                    .px_8()
+                    .child(
+                        div()
+                            .w_full()
+                            .px(EDITOR_TEXT_INSET)
+                            .child(div().w_full().h(px(1.)).bg(ink(0.055))),
+                    ),
+            )
+            // Body: markdown editor with comfortable measure and breathing room.
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(740.))
+                    .mx_auto()
+                    .px_8()
+                    .pt(px(16.))
+                    .pb_6()
+                    .child(BlockEditor::new(&editor).auto_grow(12, 60)),
+            );
+
+        // Footer left: the current note's tags + only busy/error states, all
+        // rendered through `ink(alpha)` so every paper colour reads cleanly.
         let footer_tags: Vec<String> = self
             .selected_id
             .as_deref()
@@ -1590,9 +1853,10 @@ impl AppState {
                     .collect()
             })
             .unwrap_or_default();
-        let status_text = match &self.status {
-            SyncStatus::Error(e) => Some(format!("⚠ {e}")),
-            SyncStatus::Busy(s) => Some(format!("⏳ {s}")),
+
+        let status_badge = match &self.status {
+            SyncStatus::Error(e) => Some((true, e.clone())),
+            SyncStatus::Busy(s) => Some((false, s.clone())),
             _ => None,
         };
 
@@ -1603,57 +1867,65 @@ impl AppState {
             .map(ticks::format_ticks)
             .unwrap_or_default();
 
+        let meta_color = ink(0.45);
+        let pill_bg = ink(0.055);
+        let pill_fg = ink(0.62);
+
         let footer = h_flex()
             .id("editor-footer")
             .w_full()
-            .h(px(30.))
+            .h(px(29.))
             .flex_none()
-            .px_4()
+            .px_5()
             .border_t_1()
-            .border_color(rgb(theme.border))
+            .border_color(ink(0.055))
             .bg(rgb(theme.paper_bg))
             .items_center()
             .justify_between()
             .child(
                 h_flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1p5()
+                    .min_w_0()
                     .children(footer_tags.iter().map(|name| {
                         div()
                             .px_2()
                             .py(px(1.))
                             .rounded_full()
-                            .bg(rgb(if theme.is_dark { 0x3A4048 } else { 0xEDF0F4 }))
+                            .bg(pill_bg)
                             .child(
                                 Label::new(format!("#{name}"))
-                                    .text_size(px(10.))
-                                    .text_color(if theme.is_dark {
-                                        rgb(0xCBD5E1)
-                                    } else {
-                                        rgb(0x7B8494)
-                                    }),
+                                    .text_size(px(10.5))
+                                    .text_color(pill_fg),
                             )
                     }))
-                    .when_some(status_text, |el, text| {
+                    .when_some(status_badge, |el, (is_err, text)| {
+                        let color = if is_err {
+                            rgb(0xC04646)
+                        } else {
+                            meta_color.into()
+                        };
                         el.child(
-                            Label::new(text)
-                                .text_size(px(11.))
-                                .text_color(if theme.is_dark {
-                                    rgb(0xD1D5DB)
-                                } else {
-                                    rgb(0x8B94A3)
-                                }),
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Icon::new(if is_err {
+                                        AssetIconName::CircleAlert
+                                    } else {
+                                        AssetIconName::RefreshCw
+                                    })
+                                    .size(px(10.5))
+                                    .text_color(color),
+                                )
+                                .child(Label::new(text).text_size(px(10.5)).text_color(color)),
                         )
                     })
                     .when(self.native_app_running, |el| {
                         el.child(
                             Label::new("Windows 便签正在运行，修改可能被其覆盖")
                                 .text_size(px(10.5))
-                                .text_color(if theme.is_dark {
-                                    rgb(0xE5B567)
-                                } else {
-                                    rgb(0xB07D1E)
-                                }),
+                                .text_color(rgb(0xA67316)),
                         )
                     }),
             )
@@ -1661,22 +1933,21 @@ impl AppState {
                 h_flex()
                     .items_center()
                     .gap_3()
+                    .flex_none()
                     .when(chars > 0, |el| {
                         el.child(
                             Label::new(format!("共 {chars} 字 · {lines} 行"))
                                 .text_size(px(10.5))
-                                .text_color(rgb(0x9AA3B2)),
+                                .text_color(meta_color),
                         )
                     })
-                    .child(
-                        Label::new(if current_note_updated.is_empty() {
-                            String::new()
-                        } else {
-                            format!("修改于 {current_note_updated}")
-                        })
-                        .text_size(px(10.5))
-                        .text_color(rgb(0x9AA3B2)),
-                    ),
+                    .when(!current_note_updated.is_empty(), |el| {
+                        el.child(
+                            Label::new(format!("修改于 {current_note_updated}"))
+                                .text_size(px(10.5))
+                                .text_color(meta_color),
+                        )
+                    }),
             );
 
         v_flex()
@@ -1685,87 +1956,28 @@ impl AppState {
             .min_w_0()
             .h_full()
             .bg(rgb(theme.paper_bg))
-            .child(toolbar)
+            .child(header)
             .child(editor_content)
             .child(footer)
     }
 
-    // Canvas top toolbar: the palette only, plus the overflow menu.
-    // Tagging lives in the sidebar and in the note-card right-click menu.
-    fn render_canvas_toolbar(
+    // =========================================================================
+    // Settings modal (Tahoe solid-glass surface + concentric geometry)
+    // =========================================================================
+    fn render_settings_modal(
         &mut self,
-        current_theme: &'static ThemeSpec,
+        _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        // --- 1. Color Palette Swatches (Capsule track) ---
-        let mut palette = h_flex()
-            .items_center()
-            .gap(px(5.))
-            .px_2()
-            .py_1()
-            .rounded(px(9999.))
-            .bg(if current_theme.is_dark {
-                rgb(0x27272A)
-            } else {
-                rgb(0xFFFFFF)
-            })
-            .border_1()
-            .border_color(rgb(current_theme.border))
-            .shadow(capsule_control_edge(current_theme.is_dark))
-            .flex_none();
+    ) -> AnyElement {
+        let accent = rgb(0x3B6EA8);
+        let text = rgb(INK_PRIMARY);
+        let muted = rgb(INK_MUTED);
 
-        for t in THEMES {
-            let theme_name = t.name.to_string();
-            let is_cur = t.name == current_theme.name;
-
-            // Pure color dot. The selected one is slightly larger and lifted
-            // by a soft shadow — no ring, no center dot, no dark circle.
-            let mut circle = div()
-                .id(ElementId::Name(format!("palette-{}", t.name).into()))
-                .size(if is_cur { px(17.) } else { px(14.) })
-                .flex_none()
-                .rounded_full()
-                .cursor_pointer()
-                .bg(rgb(t.accent));
-
-            if is_cur {
-                circle = circle.shadow(vec![lifted_swatch_shadow(t.is_dark)]);
-            }
-
-            circle = circle.on_click(cx.listener(move |this, _, _window, cx| {
-                this.set_theme(&theme_name, cx);
-            }));
-
-            palette = palette.child(circle);
-        }
-
-        h_flex()
-            .id("canvas-toolbar")
-            .w_full()
-            .h(px(52.))
-            .flex_none()
-            .px_4()
-            .border_b_1()
-            .border_color(rgb(current_theme.border))
-            .bg(rgb(current_theme.paper_bg))
-            .items_center()
-            .child(palette)
-    }
-
-    // =========================================================================
-    // Settings modal (WebDAV + sync strategy)
-    // =========================================================================
-    fn render_settings_modal(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let accent = rgb(0x4F7DA8);
-        let text = rgb(0x2B3440);
-        let muted = rgb(0x8B94A3);
-        let border = rgb(0xE4E8EE);
-
-        let test_status = match &self.webdav_test {
+        let test_status: Option<(Rgba, Option<IconName>, String)> = match &self.webdav_test {
             WebDavTest::Idle => None,
-            WebDavTest::Testing => Some((rgb(0x8B94A3), "正在连接…".to_string())),
-            WebDavTest::Ok(msg) => Some((rgb(0x2F8F5B), format!("✓ {msg}"))),
-            WebDavTest::Err(msg) => Some((rgb(0xC04646), format!("✕ {msg}"))),
+            WebDavTest::Testing => Some((muted, None, "正在连接…".to_string())),
+            WebDavTest::Ok(msg) => Some((rgb(0x2A8555), Some(IconName::Check), msg.clone())),
+            WebDavTest::Err(msg) => Some((rgb(0xC04646), Some(IconName::Close), msg.clone())),
         };
         let testing = self.webdav_test == WebDavTest::Testing;
 
@@ -1781,22 +1993,28 @@ impl AppState {
                      muted: Rgba| {
             v_flex()
                 .id(key)
-                .gap(px(6.))
-                .child(Label::new(label.to_string()).text_size(px(11.5)).text_color(muted))
+                .gap(px(5.))
+                .child(
+                    Label::new(label.to_string())
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(muted),
+                )
                 .child(
                     div()
-                        .h(px(34.))
+                        .h(px(33.))
                         .px_2p5()
                         .flex()
                         .items_center()
-                        .rounded(px(8.))
+                        .rounded(px(8.5))
                         .bg(rgb(0xFFFFFF))
-                        .border_1()
-                        .border_color(border)
+                        .shadow(capsule_control_edge())
                         .child(
                             div().flex_1().min_w_0().child({
-                                let mut widget =
-                                    Input::new(input).appearance(false).focus_bordered(false);
+                                let mut widget = Input::new(input)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .focus_bordered(false);
                                 if password {
                                     widget = widget.mask_toggle();
                                 }
@@ -1808,19 +2026,19 @@ impl AppState {
 
         let mut rows = v_flex().gap(px(16.));
 
-        // --- Sync strategy switches ---
+        // --- Sync strategy switches (concentric rounded(12) inside rounded(18) modal) ---
         let webdav_on = self.config.webdav_auto;
         let ms_on = self.config.microsoft;
         rows = rows.child(
             div()
-                .rounded(px(10.))
-                .bg(rgb(0xF7F9FB))
-                .border_1()
-                .border_color(border)
-                .p(px(14.))
+                .rounded(px(12.))
+                .bg(rgb(0xF6F8FA))
+                .shadow(vec![hairline_edge(false, 0.06)])
+                .px(px(14.))
+                .py(px(12.))
                 .flex()
                 .flex_col()
-                .gap(px(12.))
+                .gap(px(11.))
                 .child(
                     h_flex()
                         .justify_between()
@@ -1829,10 +2047,15 @@ impl AppState {
                         .child(
                             v_flex()
                                 .gap(px(2.))
-                                .child(Label::new("自动同步（WebDAV）").text_size(px(12.5)).text_color(text))
+                                .child(
+                                    Label::new("自动同步（WebDAV）")
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(text),
+                                )
                                 .child(
                                     Label::new("编辑后约 2.5 秒上传；启动与后台定时拉取")
-                                        .text_size(px(10.5))
+                                        .text_size(px(11.))
                                         .text_color(muted),
                                 ),
                         )
@@ -1845,6 +2068,7 @@ impl AppState {
                             ),
                         ),
                 )
+                .child(div().w_full().h(px(1.)).bg(shell_hairline()))
                 .child(
                     h_flex()
                         .justify_between()
@@ -1856,12 +2080,15 @@ impl AppState {
                                 .child(
                                     Label::new("同步微软账户（Windows 便签）")
                                         .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
                                         .text_color(text),
                                 )
                                 .child(
-                                    Label::new("可选；开启后会跟随原生便签与云端的变化")
-                                        .text_size(px(10.5))
-                                        .text_color(muted),
+                                    Label::new(
+                                        "可选；跟随原生便签与云端（纯文本，不含 Markdown 格式）",
+                                    )
+                                    .text_size(px(11.))
+                                    .text_color(muted),
                                 ),
                         )
                         .child(
@@ -1876,91 +2103,128 @@ impl AppState {
         );
 
         // --- WebDAV form ---
-        let mut form = v_flex().gap(px(12.));
-        form = form.child(Label::new("WebDAV 服务器").text_size(px(12.)).text_color(text));
+        let mut form = v_flex().gap(px(11.));
+        form = form.child(
+            Label::new("WebDAV 服务器")
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(text),
+        );
         if let Some(inputs) = &self.settings {
             form = form
-                .child(field("settings-url", "服务器地址（URL）", &inputs.url, false, muted))
+                .child(field(
+                    "settings-url",
+                    "服务器地址（URL）",
+                    &inputs.url,
+                    false,
+                    muted,
+                ))
                 .child(field("settings-user", "用户名", &inputs.user, false, muted))
                 .child(field("settings-pass", "密码", &inputs.pass, true, muted))
-                .child(field("settings-dir", "远端同步目录", &inputs.dir, false, muted));
+                .child(field(
+                    "settings-dir",
+                    "远端同步目录",
+                    &inputs.dir,
+                    false,
+                    muted,
+                ));
         }
 
-        let sync_label = if self.webdav_syncing { "同步中…" } else { "立即同步" };
-        let mut actions = h_flex().items_center().gap_3().child(
-            div()
-                .id("btn-webdav-test")
-                .h(px(32.))
-                .px_4()
-                .flex()
-                .items_center()
-                .rounded(px(8.))
-                .bg(if testing { rgb(0xE8EDF3) } else { accent })
-                .cursor_pointer()
-                .child(
-                    Label::new(if testing { "测试中…" } else { "测试连接" })
-                        .text_size(px(12.))
-                        .text_color(if testing { rgb(0x6B7480) } else { rgb(0xFFFFFF) }),
-                )
-                .when(!testing, |el| {
-                    el.on_click(cx.listener(|this, _, window, cx| this.test_webdav(window, cx)))
-                }),
-        );
-        actions = actions.child(
-            div()
-                .id("btn-webdav-sync")
-                .h(px(32.))
-                .px_4()
-                .flex()
-                .items_center()
-                .rounded(px(8.))
-                .bg(rgb(0xFFFFFF))
-                .border_1()
-                .border_color(border)
-                .cursor_pointer()
-                .hover(|el| el.bg(rgb(0xF2F5F9)))
-                .child(
-                    Label::new(sync_label)
-                        .text_size(px(12.))
-                        .text_color(if self.webdav_syncing { muted } else { text }),
-                )
-                .when(!self.webdav_syncing, |el| {
-                    el.on_click(cx.listener(|this, _, window, cx| {
-                        this.start_webdav_sync(window, cx)
-                    }))
-                }),
-        );
-        if let Some((color, msg)) = test_status {
+        let sync_label = if self.webdav_syncing {
+            "同步中…"
+        } else {
+            "立即同步"
+        };
+        let mut actions = h_flex()
+            .pt(px(2.))
+            .items_center()
+            .gap_2p5()
+            .flex_wrap()
+            .child(
+                div()
+                    .id("btn-webdav-test")
+                    .h(px(31.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .rounded(px(9999.))
+                    .bg(if testing {
+                        rgb(0xE8EDF3)
+                    } else {
+                        rgb(PRIMARY_BTN)
+                    })
+                    .shadow(capsule_control_edge())
+                    .when(!testing, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(rgb(PRIMARY_BTN_HOVER)))
+                            .active(|s| s.bg(rgb(PRIMARY_BTN_ACTIVE)))
+                            .on_click(cx.listener(|this, _, window, cx| this.test_webdav(window, cx)))
+                    })
+                    .child(
+                        Label::new(if testing { "测试中…" } else { "测试连接" })
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if testing { muted } else { rgb(0xFFFFFF) }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("btn-webdav-sync")
+                    .h(px(31.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .rounded(px(9999.))
+                    .bg(rgb(0xFFFFFF))
+                    .shadow(capsule_control_edge())
+                    .when(!self.webdav_syncing, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(rgb(0xF6F8FB)))
+                            .active(|s| s.bg(rgb(0xECEFF5)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_webdav_sync(window, cx, true)
+                            }))
+                    })
+                    .child(
+                        Label::new(sync_label)
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if self.webdav_syncing { muted } else { text }),
+                    ),
+            );
+
+        if let Some((color, maybe_icon, msg)) = test_status {
             actions = actions.child(
-                Label::new(msg)
-                    .text_size(px(11.))
-                    .text_color(color),
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .when_some(maybe_icon, |el, ic| {
+                        el.child(Icon::new(ic).size(px(11.)).text_color(color))
+                    })
+                    .child(Label::new(msg).text_size(px(11.)).text_color(color)),
             );
         } else if let Some(msg) = &self.webdav_message {
             actions = actions.child(Label::new(msg.clone()).text_size(px(11.)).text_color(muted));
         }
+
         form = form.child(actions);
         form = form.child(
-            Label::new("每条便签保存为 <id>.md，带 YAML Frontmatter，可在任意 Markdown 编辑器中阅读。")
-                .text_size(px(10.5))
-                .text_color(muted),
+            Label::new(
+                "每条便签保存为 <id>.md，带 YAML Frontmatter，可在任意 Markdown 编辑器中阅读。",
+            )
+            .text_size(px(10.5))
+            .text_color(muted),
         );
         rows = rows.child(form);
 
         let card = v_flex()
             .id("settings-card")
-            .w(px(540.))
+            .w(px(510.))
             .max_h(px(660.))
-            .rounded(px(14.))
+            .rounded(px(18.))
             .bg(rgb(0xFFFFFF))
-            .shadow(vec![BoxShadow {
-                inset: false,
-                color: hsla(0., 0., 0., 0.24),
-                offset: point(px(0.), px(18.)),
-                blur_radius: px(48.),
-                spread_radius: px(0.),
-            }])
-            .p(px(22.))
+            .shadow(modal_surface_shadow())
+            .p(px(20.))
             .gap(px(16.))
             .child(
                 h_flex()
@@ -1969,7 +2233,12 @@ impl AppState {
                     .child(
                         v_flex()
                             .gap(px(2.))
-                            .child(Label::new("设置").text_size(px(17.)).text_color(text))
+                            .child(
+                                Label::new("设置")
+                                    .text_size(px(16.5))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(text),
+                            )
                             .child(
                                 Label::new("数据同步与 WebDAV")
                                     .text_size(px(11.))
@@ -1983,13 +2252,14 @@ impl AppState {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
+                            .rounded_full()
                             .cursor_pointer()
-                            .hover(|el| el.bg(rgb(0xF0F3F7)))
+                            .hover(|el| el.bg(shell_hover()))
+                            .active(|el| el.bg(shell_active()))
                             .child(
                                 Icon::new(AssetIconName::X)
                                     .size(px(14.))
-                                    .text_color(rgb(0x6B7480)),
+                                    .text_color(rgb(INK_SECONDARY)),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_settings(window, cx)
@@ -2016,27 +2286,34 @@ impl AppState {
             .flex()
             .items_center()
             .justify_center()
-            .bg(hsla(0., 0., 0., 0.34))
+            .bg(hsla(220. / 360., 0.22, 0.08, 0.36))
             .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key.eq_ignore_ascii_case("escape") {
-                    this.close_settings(window, cx);
-                }
-            }))
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                        this.close_settings(window, cx);
+                    }
+                }),
+            )
             .child(card)
             .into_any_element()
     }
 }
 
-/// Compact on/off switch used in the settings dialog.
+/// Compact Tahoe pill switch used in the settings dialog.
 fn settings_switch(id: &'static str, on: bool, accent: Rgba) -> Stateful<Div> {
+    let off_bg = rgb(0xD2D8E2);
+    let off_hover = rgb(0xC3CBD8);
+    let on_hover = rgb(0x336094);
     div()
         .id(id)
         .w(px(38.))
         .h(px(22.))
         .flex_none()
-        .rounded(px(11.))
-        .bg(if on { accent } else { rgb(0xD5DAE2) })
+        .rounded_full()
+        .bg(if on { accent } else { off_bg })
+        .hover(move |s| s.bg(if on { on_hover } else { off_hover }))
+        .active(|s| s.opacity(0.88))
         .cursor_pointer()
         .relative()
         .child(
@@ -2049,9 +2326,9 @@ fn settings_switch(id: &'static str, on: bool, accent: Rgba) -> Stateful<Div> {
                 .bg(rgb(0xFFFFFF))
                 .shadow(vec![BoxShadow {
                     inset: false,
-                    color: hsla(0., 0., 0., 0.18),
+                    color: hsla(0., 0., 0., 0.20),
                     offset: point(px(0.), px(1.)),
-                    blur_radius: px(2.),
+                    blur_radius: px(2.5),
                     spread_radius: px(0.),
                 }]),
         )
