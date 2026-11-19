@@ -1,116 +1,97 @@
-//! Pre-write backups of plum.sqlite (+ WAL sidecars).
+//! Rolling snapshots of the note database.
+//!
+//! A snapshot is a complete, verified copy (`notes-<UTC stamp>.db`) kept in
+//! the app-data folder — deliberately not next to the database, so a custom
+//! data folder on another drive still has its backups here.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use super::{PlumError, Result};
+use super::{NoteStore, Result};
 
-const KEEP: usize = 20;
-const MIN_INTERVAL: Duration = Duration::from_secs(300);
+/// Snapshots kept; the oldest are removed first.
+pub const KEEP: usize = 30;
+/// No new snapshot while the newest one is younger than this.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 
-static LAST_BACKUP_TIME: AtomicU64 = AtomicU64::new(0);
+const PREFIX: &str = "notes-";
+const SUFFIX: &str = ".db";
 
-fn backup_dir() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    Path::new(&base).join("stickynotes").join("backups")
+/// `%LOCALAPPDATA%\stickynotes\backups`.
+pub fn default_dir() -> PathBuf {
+    crate::config::config_dir().join("backups")
 }
 
-/// Copy plum.sqlite + -wal + -shm into a timestamped backup dir.
-/// Skips if a backup was made within MIN_INTERVAL (avoids hammering on autosave).
-pub fn backup_if_needed(plum: &Path) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let last = LAST_BACKUP_TIME.load(Ordering::Relaxed);
-    if last > 0 && now.saturating_sub(last) < MIN_INTERVAL.as_secs() {
-        return Ok(());
-    }
-
-    let dir = backup_dir();
-    if let Some(last_sys) = latest_backup_time(&dir) {
-        if last_sys.elapsed().unwrap_or(MIN_INTERVAL * 2) < MIN_INTERVAL {
-            LAST_BACKUP_TIME.store(now, Ordering::Relaxed);
-            return Ok(());
-        }
-    }
-    do_backup(plum, &dir)?;
-    LAST_BACKUP_TIME.store(now, Ordering::Relaxed);
-    Ok(())
+fn is_snapshot(name: &str) -> bool {
+    name.starts_with(PREFIX) && name.ends_with(SUFFIX)
 }
 
-pub fn do_backup(plum: &Path, dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    let stamp = now_stamp();
-    let dest = dir.join(stamp);
-    fs::create_dir_all(&dest)?;
-
-    let base = plum.to_path_buf();
-    for suffix in ["", "-wal", "-shm"] {
-        let src = {
-            let mut p = base.clone();
-            p.as_mut_os_string().push(suffix);
-            p
-        };
-        if src.exists() {
-            let name = src.file_name().unwrap_or_default();
-            fs::copy(&src, dest.join(name))?;
-        }
-    }
-
-    // Verify the main db copy is a valid SQLite file (header check, cheap).
-    let copied = dest.join("plum.sqlite");
-    if copied.exists() {
-        let mut header = [0u8; 16];
-        use std::io::Read;
-        let mut f = fs::File::open(&copied)?;
-        f.read_exact(&mut header)?;
-        if &header[..15] != b"SQLite format 3" {
-            return Err(PlumError::Other("backup integrity check failed".into()));
-        }
-    }
-
-    prune(dir)?;
-    Ok(())
-}
-
-fn latest_backup_time(dir: &Path) -> Option<std::time::SystemTime> {
-    let mut newest: Option<(String, std::time::SystemTime)> = None;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if let Ok(meta) = e.metadata() {
-                if let Ok(t) = meta.modified() {
-                    if newest.as_ref().map(|(n, _)| name > *n).unwrap_or(true) {
-                        newest = Some((name, t));
-                    }
-                }
-            }
-        }
-    }
-    newest.map(|(_, t)| t)
-}
-
-fn prune(dir: &Path) -> Result<()> {
-    let mut names: Vec<String> = fs::read_dir(dir)?
+/// Names of the snapshots in `dir`, oldest first (the stamp sorts by time).
+fn snapshot_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .into_iter()
         .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| is_snapshot(name))
         .collect();
     names.sort();
-    while names.len() > KEEP {
-        let oldest = names.remove(0);
-        fs::remove_dir_all(dir.join(oldest))?;
+    names
+}
+
+/// Snapshot `store` into `dir` unless a recent snapshot exists or there is
+/// nothing to protect yet. Returns the file written, if any.
+pub fn backup_if_due(store: &NoteStore, dir: &Path) -> Result<Option<PathBuf>> {
+    if store.is_in_memory() || store.note_count()? == 0 {
+        return Ok(None);
+    }
+    let newest = snapshot_names(dir)
+        .pop()
+        .and_then(|name| fs::metadata(dir.join(name)).ok())
+        .and_then(|meta| meta.modified().ok());
+    if let Some(written) = newest {
+        // A timestamp from the future (clock change) counts as "long ago".
+        if written.elapsed().is_ok_and(|age| age < MIN_INTERVAL) {
+            return Ok(None);
+        }
+    }
+    snapshot(store, dir).map(Some)
+}
+
+/// Write a snapshot now and drop the ones beyond [`KEEP`].
+pub fn snapshot(store: &NoteStore, dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let stamp = now_stamp();
+    let mut dest = dir.join(format!("{PREFIX}{stamp}{SUFFIX}"));
+    // Two snapshots within the same second get distinct names.
+    let mut n = 1;
+    while dest.exists() {
+        n += 1;
+        dest = dir.join(format!("{PREFIX}{stamp}-{n}{SUFFIX}"));
+    }
+    store.copy_to(&dest)?;
+    prune(dir)?;
+    Ok(dest)
+}
+
+/// Remove the oldest snapshots beyond [`KEEP`]. Only this module's own files
+/// are touched; anything else in the folder stays.
+fn prune(dir: &Path) -> Result<()> {
+    let names = snapshot_names(dir);
+    let excess = names.len().saturating_sub(KEEP);
+    for name in &names[..excess] {
+        fs::remove_file(dir.join(name))?;
     }
     Ok(())
 }
 
 fn now_stamp() -> String {
-    let t = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = t.as_secs();
+        .unwrap_or_default()
+        .as_secs();
     let (y, mo, d, h, mi, s) = civil_from_unix(secs as i64);
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
@@ -141,4 +122,106 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::plum::testing::temp_dir;
+
+    fn store_with_a_note(dir: &Path) -> NoteStore {
+        let store = NoteStore::open(&dir.join("stickynotes.db")).unwrap();
+        store.create_note("# 便签\n内容", "Yellow").unwrap();
+        store
+    }
+
+    #[test]
+    fn a_snapshot_is_a_complete_database() {
+        let dir = temp_dir("backup-snapshot");
+        let store = store_with_a_note(&dir);
+        let backups = dir.join("backups");
+
+        let file = snapshot(&store, &backups).unwrap();
+        assert!(is_snapshot(&file.file_name().unwrap().to_string_lossy()));
+        let copy = NoteStore::open(&file).unwrap();
+        assert_eq!(copy.live_notes().unwrap(), store.live_notes().unwrap());
+
+        // Same second: a second snapshot does not overwrite the first.
+        let second = snapshot(&store, &backups).unwrap();
+        assert_ne!(file, second);
+        assert_eq!(snapshot_names(&backups).len(), 2);
+        drop((store, copy));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_backup_is_due_only_without_a_recent_snapshot() {
+        let dir = temp_dir("backup-due");
+        let store = store_with_a_note(&dir);
+        let backups = dir.join("backups");
+
+        assert!(backup_if_due(&store, &backups).unwrap().is_some(), "first one");
+        assert!(backup_if_due(&store, &backups).unwrap().is_none(), "too recent");
+
+        // Age the snapshot past the interval.
+        let name = snapshot_names(&backups).pop().unwrap();
+        let old = std::time::SystemTime::now() - MIN_INTERVAL - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(backups.join(name))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(backup_if_due(&store, &backups).unwrap().is_some(), "due again");
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nothing_is_backed_up_before_the_first_note() {
+        let dir = temp_dir("backup-empty");
+        let backups = dir.join("backups");
+        let empty = NoteStore::open(&dir.join("stickynotes.db")).unwrap();
+        assert!(backup_if_due(&empty, &backups).unwrap().is_none());
+        let memory = NoteStore::open_in_memory().unwrap();
+        memory.create_note("x", "Yellow").unwrap();
+        assert!(backup_if_due(&memory, &backups).unwrap().is_none());
+        assert!(!backups.exists());
+        drop(empty);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_snapshots_and_nothing_else_is_touched() {
+        let dir = temp_dir("backup-prune");
+        let store = store_with_a_note(&dir);
+        let backups = dir.join("backups");
+        fs::create_dir_all(&backups).unwrap();
+
+        // Backups of the old layout (a folder per backup) and a stray file.
+        let legacy = backups.join("20261119-093333");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("plum.sqlite"), b"old").unwrap();
+        fs::write(backups.join("readme.txt"), b"keep me").unwrap();
+        for i in 0..KEEP + 4 {
+            fs::write(backups.join(format!("notes-20200101-0000{i:02}.db")), b"x").unwrap();
+        }
+
+        let newest = snapshot(&store, &backups).unwrap();
+        let names = snapshot_names(&backups);
+        assert_eq!(names.len(), KEEP);
+        assert_eq!(names.first().unwrap(), "notes-20200101-000005.db");
+        assert_eq!(backups.join(names.last().unwrap()), newest);
+        assert!(legacy.join("plum.sqlite").exists());
+        assert!(backups.join("readme.txt").exists());
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stamps_are_utc_calendar_times() {
+        assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
+        // 2026-11-19 09:33:33 UTC
+        assert_eq!(civil_from_unix(1_795_080_813), (2026, 11, 19, 9, 33, 33));
+    }
 }

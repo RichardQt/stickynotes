@@ -9,7 +9,7 @@
 
 use crate::config::WebDavConfig;
 use crate::ticks;
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::Client;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,7 +33,7 @@ pub struct SyncNote {
     pub color: String,
     pub tags: Vec<String>,
     pub pinned: bool,
-    /// .NET ticks, same unit as the plum `UpdatedAt` column.
+    /// .NET ticks, same unit as the note database's `updated_at` column.
     pub updated_at: i64,
     /// Full Markdown (title line + body).
     pub markdown: String,
@@ -163,7 +163,7 @@ pub struct SyncOutcome {
 /// not been removed yet. Survives restarts, so an unlink that happened while
 /// WebDAV was off (or down) still propagates on the next pass. Only ids and
 /// timestamps — never note content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteLedger {
     #[serde(default)]
     pub url: String,
@@ -176,12 +176,6 @@ pub struct DeleteLedger {
 
 pub fn ledger_path() -> PathBuf {
     crate::config::config_dir().join("webdav-deletions.json")
-}
-
-impl Default for DeleteLedger {
-    fn default() -> Self {
-        Self { url: String::new(), dir: String::new(), deleted: BTreeMap::new() }
-    }
 }
 
 impl DeleteLedger {
@@ -414,6 +408,17 @@ pub fn sync(
     ledger: &mut DeleteLedger,
 ) -> Result<SyncOutcome, String> {
     let client = WebDavClient::new(cfg)?;
+    sync_with_client(&client, cfg, notes, cache, ensure_dir, ledger)
+}
+
+fn sync_with_client(
+    client: &WebDavClient,
+    cfg: &WebDavConfig,
+    notes: &[SyncNote],
+    cache: &SyncCache,
+    ensure_dir: bool,
+    ledger: &mut DeleteLedger,
+) -> Result<SyncOutcome, String> {
     if ensure_dir {
         client.ensure_dir(&cfg.dir)?;
     }
@@ -443,8 +448,9 @@ pub fn sync(
             continue;
         }
         let file = format!("{id}.md");
-        client.delete(&cfg.dir, &file)?;
-        report.deleted_remote += 1;
+        if client.delete(&cfg.dir, &file)? {
+            report.deleted_remote += 1;
+        }
         let deleted_at = ledger.deleted[&id];
         remote_deleted.insert(id, deleted_at);
         fresh.files.remove(&file);
@@ -469,7 +475,7 @@ pub fn sync(
         // touched since the last pass and its body is not needed.
         let remote = match hit {
             Some(c) => RemoteVersion::Known { updated_at: c.updated_at },
-            None => match fetch_remote(&client, &cfg.dir, &entry.name)? {
+            None => match fetch_remote(client, &cfg.dir, &entry.name)? {
                 Some((meta, body)) => RemoteVersion::Fetched { meta, body },
                 None => {
                     // Not one of our files (or truncated): leave it alone.
@@ -488,7 +494,7 @@ pub fn sync(
 
         let Some(local) = local else {
             // Remote-only file: needs its body before it can be created here.
-            let Some((meta, body)) = into_body(&client, &cfg.dir, &entry.name, remote)? else {
+            let Some((meta, body)) = into_body(client, &cfg.dir, &entry.name, remote)? else {
                 continue;
             };
             fresh
@@ -500,7 +506,7 @@ pub fn sync(
         };
 
         if remote_updated > local.updated_at {
-            let Some((meta, body)) = into_body(&client, &cfg.dir, &entry.name, remote)? else {
+            let Some((meta, body)) = into_body(client, &cfg.dir, &entry.name, remote)? else {
                 continue;
             };
             fresh
@@ -758,21 +764,23 @@ impl WebDavClient {
             .map(str::to_string))
     }
 
-    pub fn delete(&self, dir: &str, name: &str) -> Result<(), String> {
+    /// Delete one remote file. Returns `Ok(true)` when the server removed it
+    /// and `Ok(false)` when it was already gone (HTTP 404 / 410), so deleting a
+    /// note that never reached the server or was already removed on another
+    /// device is idempotent.
+    pub fn delete(&self, dir: &str, name: &str) -> Result<bool, String> {
         let resp = self
             .request(Method::DELETE, &self.url(&join_path(dir, name)))
             .send()
             .map_err(|e| format!("删除 {name} 失败：{e}"))?;
-        check(resp, &format!("删除 {name}"))
-    }
-}
-
-fn check(resp: Response, what: &str) -> Result<(), String> {
-    let status = resp.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(format!("{what} 失败：HTTP {}", status.as_u16()))
+        let status = resp.status();
+        if status.is_success() {
+            Ok(true)
+        } else if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            Ok(false)
+        } else {
+            Err(format!("删除 {name} 失败：HTTP {}", status.as_u16()))
+        }
     }
 }
 
@@ -1094,5 +1102,125 @@ mod tests {
         assert_eq!(join_path("/StickyNotes/", "a.md"), "/StickyNotes/a.md");
         assert_eq!(join_path("StickyNotes", "a.md"), "/StickyNotes/a.md");
         assert_eq!(join_path("", "a.md"), "/a.md");
+    }
+
+    /// Minimal scripted HTTP server so WebDAV edge cases run offline and bypass
+    /// any system HTTP proxy.
+    fn run_mock_dav(
+        responses: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (WebDavConfig, WebDavClient, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..pos]);
+                            let first = head.lines().next().unwrap_or("").to_string();
+                            seen.push(first);
+                            for line in head.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                            header_end = Some(pos + 4);
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        if buf.len() >= end + content_len {
+                            break;
+                        }
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+            seen
+        });
+        let base = format!("http://{addr}/dav");
+        let cfg = WebDavConfig {
+            url: base.clone(),
+            username: "u".into(),
+            password: "p".into(),
+            dir: "/StickyNotes".into(),
+        };
+        let client = WebDavClient {
+            client: Client::builder().no_proxy().build().unwrap(),
+            base,
+            username: "u".into(),
+            password: "p".into(),
+        };
+        (cfg, client, handle)
+    }
+
+    #[test]
+    fn delete_treats_404_and_410_as_already_gone_and_prunes_ledger() {
+        let propfind_empty = r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+            <d:response><d:href>/dav/StickyNotes/</d:href></d:response>
+        </d:multistatus>"#;
+        let (cfg, client, server) = run_mock_dav(vec![
+            ("207 Multi-Status", "application/xml", propfind_empty),
+            ("404 Not Found", "text/plain", ""),
+            ("410 Gone", "text/plain", ""),
+            ("204 No Content", "text/plain", ""),
+        ]);
+
+        let mut ledger = DeleteLedger::default();
+        ledger.record(&cfg, "11111111-1111-1111-1111-111111111111", 10);
+        ledger.record(&cfg, "22222222-2222-2222-2222-222222222222", 20);
+        ledger.record(&cfg, "33333333-3333-3333-3333-333333333333", 30);
+
+        let outcome =
+            sync_with_client(&client, &cfg, &[], &SyncCache::default(), false, &mut ledger)
+                .expect("404 and 410 on DELETE must not fail sync");
+        let requests = server.join().unwrap();
+
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].starts_with("DELETE /dav/StickyNotes/11111111-"));
+        assert!(requests[2].starts_with("DELETE /dav/StickyNotes/22222222-"));
+        assert!(requests[3].starts_with("DELETE /dav/StickyNotes/33333333-"));
+        // Only the 204 actually removed a remote file; all three tombstones are retired.
+        assert_eq!(outcome.report.deleted_remote, 1);
+        assert!(outcome.ledger.deleted.is_empty());
+        assert!(ledger.deleted.is_empty());
+    }
+
+    #[test]
+    fn delete_still_reports_real_server_errors_and_keeps_tombstone() {
+        let propfind_empty = r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"></d:multistatus>"#;
+        let (cfg, client, server) = run_mock_dav(vec![
+            ("207 Multi-Status", "application/xml", propfind_empty),
+            ("500 Internal Server Error", "text/plain", "boom"),
+        ]);
+
+        let mut ledger = DeleteLedger::default();
+        ledger.record(&cfg, "11111111-1111-1111-1111-111111111111", 10);
+
+        let err = sync_with_client(&client, &cfg, &[], &SyncCache::default(), false, &mut ledger)
+            .expect_err("500 on DELETE must fail so the tombstone is retried");
+        server.join().unwrap();
+        assert!(err.contains("HTTP 500"), "unexpected error: {err}");
+        assert_eq!(ledger.deleted.len(), 1);
     }
 }

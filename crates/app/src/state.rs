@@ -2,21 +2,21 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 use markdown_editor::{BlockEditorEvent, BlockEditorState};
 use stickynotes_core::{
-    config::SyncConfig,
-    markup,
-    store::model::NoteSummary,
-    sync::{self, SyncCoordinator},
-    tags::{Tag, TagStore},
+    config::{self, AppConfig},
+    store::{
+        self, backup, import, legacy,
+        model::{NoteSummary, RemoteUpdate, Tag},
+        NoteStore,
+    },
     webdav,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// Visual spec for plum themes with refined paper aesthetics.
+/// Visual spec for note papers with refined paper aesthetics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeSpec {
     pub name: &'static str,
@@ -73,27 +73,27 @@ pub const THEMES: &[ThemeSpec] = &[
         label: "晨雾灰",
         accent: 0x9AA5B1,
         paper_bg: 0xF9FAFB,
-        card_active_bg: 0xEEF1F4,
-        border: 0xE0E5EA,
+        card_active_bg: 0xE5E9F0,
+        border: 0xCBD3DF,
     },
     ThemeSpec {
         name: "White",
         label: "纯白",
         accent: 0xB4BCC8,
         paper_bg: 0xFFFFFF,
-        card_active_bg: 0xF3F4F6,
-        border: 0xE8EAEF,
+        card_active_bg: 0xEAF0FA,
+        border: 0xC6D6EC,
     },
 ];
 
-pub fn get_theme(name: Option<&str>) -> &'static ThemeSpec {
-    // The native app also offers a dark "Charcoal" paper. This app draws only
-    // light papers, so such a note is shown on the neutral gray one. Its
-    // stored theme stays as it is until a colour is picked here.
-    let target = match name {
-        Some(n) if n.eq_ignore_ascii_case("Charcoal") => "Gray",
-        Some(n) => n,
-        None => "Yellow",
+pub fn get_theme(name: &str) -> &'static ThemeSpec {
+    // Windows Sticky Notes also offers a dark "Charcoal" paper. This app draws
+    // only light papers, so a note imported with it is shown on the neutral
+    // gray one. Its stored theme stays as it is until a colour is picked here.
+    let target = if name.eq_ignore_ascii_case("Charcoal") {
+        "Gray"
+    } else {
+        name
     };
     THEMES
         .iter()
@@ -118,6 +118,13 @@ pub enum WebDavTest {
     Err(String),
 }
 
+/// Outcome of the last action in the settings dialog's storage section.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StorageNote {
+    Info(String),
+    Error(String),
+}
+
 /// Settings dialog form fields, created on first open.
 pub struct SettingsInputs {
     pub url: Entity<InputState>,
@@ -126,38 +133,33 @@ pub struct SettingsInputs {
     pub dir: Entity<InputState>,
 }
 
-/// Cheap change fingerprint for the plum database: (mtime nanos, length) of
-/// the main file and of the WAL, which is where WAL-mode writes land first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DbSignature {
-    main: (u64, u64),
-    wal: (u64, u64),
-}
-
-fn file_sig(path: &Path) -> (u64, u64) {
-    match std::fs::metadata(path) {
-        Ok(m) => {
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            (mtime, m.len())
-        }
-        Err(_) => (0, 0),
-    }
-}
-
-fn plum_signature(plum_path: &Path) -> DbSignature {
-    DbSignature {
-        main: file_sig(plum_path),
-        wal: file_sig(&plum_path.with_extension("sqlite-wal")),
-    }
-}
-
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+/// Do two paths name the same existing file? Spelling differences (case,
+/// `..`, links) are resolved; a path that does not exist only matches itself.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Open the database the config points at.
+///
+/// In the default folder a missing file is simply a first start, so it is
+/// created. A folder the user picked always held a database when it was
+/// chosen: if the file is gone now (the drive is not connected, the folder
+/// was moved), starting an empty database there would look like every note
+/// had vanished — that is reported instead.
+fn open_configured_database(config: &AppConfig) -> store::Result<NoteStore> {
+    let path = config.database_path();
+    if config.uses_default_data_dir() {
+        NoteStore::open(&path)
+    } else {
+        NoteStore::open_existing(&path)
+    }
 }
 
 /// Opt-in diagnostics: set `STICKYNOTES_DEBUG=1` to append save/sync decisions
@@ -168,10 +170,7 @@ fn debug_log(msg: &str) {
     if std::env::var_os("STICKYNOTES_DEBUG").is_none() {
         return;
     }
-    let Ok(local) = std::env::var("LOCALAPPDATA") else {
-        return;
-    };
-    let dir = Path::new(&local).join("stickynotes");
+    let dir = config::config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("debug.log");
     if let Ok(meta) = std::fs::metadata(&path) {
@@ -203,11 +202,18 @@ pub struct MdTip {
     /// Button's left edge and bottom edge in window coordinates.
     pub x: Pixels,
     pub y: Pixels,
+    /// Whether the hint transitioned from an adjacent button while warm, so
+    /// its x-position springs smoothly instead of snapping from a cold origin.
+    pub glide: bool,
 }
 
 pub struct AppState {
-    pub sync: Arc<SyncCoordinator>,
-    pub tags: Arc<TagStore>,
+    /// The app's own database: notes, tags and pins.
+    pub store: NoteStore,
+    /// Why the configured database could not be opened. While set, the window
+    /// shows only a recovery screen and `store` is an empty in-memory
+    /// stand-in that is never listed, edited or synced.
+    pub startup_error: Option<String>,
     pub notes: Vec<NoteSummary>,
     pub selected_id: Option<String>,
     pub editor: Option<Entity<BlockEditorState>>,
@@ -226,28 +232,32 @@ pub struct AppState {
     pub save_epoch: u64,
     pub current_stats: (usize, usize),
 
-    // Auto-sync bookkeeping
-    /// Last editor content successfully written to plum (used to tell whether
-    /// replacing the editor from disk would discard unsaved edits).
+    // Autosave bookkeeping
+    /// Last editor content successfully written to the database (tells
+    /// whether replacing the editor would discard unsaved edits).
     pub last_saved_md: Option<String>,
-    /// Exact plum text of our last successful write for the open note. Lets the
-    /// poll skip the row when the only change on disk is our own save, instead
-    /// of round-tripping it through Markdown and rewriting the editor.
-    pub last_saved_plum: Option<String>,
-    /// A save failed because the DB was momentarily locked: the note id and
-    /// Markdown to retry, captured at failure time.
+    /// A save failed because the database was momentarily locked: the note id
+    /// and Markdown to retry, captured at failure time.
     pub pending_save: Option<(String, String)>,
-    /// Fingerprint (mtime, size) of plum.sqlite + its WAL, to detect external writes.
-    db_sig: Option<DbSignature>,
-    /// Is the native Sticky Notes app open? It owns the cloud sync and keeps
-    /// its own copy of every note, which it can write back over ours.
-    pub native_app_running: bool,
-    poll_ticks: u32,
+    /// When the background loop next checks whether a backup is due.
+    next_backup_check: Instant,
 
-    // Settings & WebDAV sync
-    pub config: SyncConfig,
+    // Settings: storage
+    pub config: AppConfig,
     pub show_settings: bool,
     pub settings: Option<SettingsInputs>,
+    /// Result of the last storage action (move, import, …), shown in settings.
+    pub storage_note: Option<StorageNote>,
+    /// A folder picked in settings that already holds a database. Switching
+    /// to it replaces what is on screen, so it waits for a confirmation.
+    pub pending_adopt: Option<PathBuf>,
+    /// The system folder picker is open.
+    pub picking_folder: bool,
+    /// Bumped whenever `store` starts pointing at different notes, so a sync
+    /// pass that was computed for the previous ones is discarded.
+    store_generation: u64,
+
+    // Settings: WebDAV sync
     pub webdav_test: WebDavTest,
     pub webdav_syncing: bool,
     pub webdav_message: Option<String>,
@@ -284,6 +294,12 @@ pub struct AppState {
 
     /// Hover hint currently shown under the markdown toolbar, if any.
     pub md_tip: Option<MdTip>,
+    /// Last displayed hint kept across exit fade-out so `Presence` can render
+    /// its label and coordinates until the exit transition settles.
+    pub md_tip_last: Option<MdTip>,
+    /// When the last toolbar hint closed, enabling warm instant glide across
+    /// neighboring format buttons.
+    pub md_tip_closed_at: Option<Instant>,
     /// Button the pointer rests on right now; the hint appears after a short
     /// delay only if it is still this button.
     pub md_tip_hover: Option<&'static str>,
@@ -294,18 +310,16 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (sync, tags, err) = match (SyncCoordinator::new(), TagStore::open()) {
-            (Ok(s), Ok(t)) => (Some(Arc::new(s)), Some(Arc::new(t)), None),
-            (Err(e), _) => (None, None, Some(format!("初始化失败: {e}"))),
-            (Ok(_), Err(e)) => (None, None, Some(format!("标签库打开失败: {e}"))),
+        let config = AppConfig::load();
+        let (store, startup_error) = match open_configured_database(&config) {
+            Ok(store) => (store, None),
+            Err(e) => {
+                debug_log(&format!("open database failed: {e}"));
+                let stand_in =
+                    NoteStore::open_in_memory().expect("in-memory SQLite is always available");
+                (stand_in, Some(e.to_string()))
+            }
         };
-        let (sync, tags) = match (sync, tags) {
-            (Some(s), Some(t)) => (s, t),
-            _ => unreachable!(),
-        };
-        let _ = err;
-
-        let notes = sync.reload().unwrap_or_default();
 
         let new_tag_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("新标签名称…")
@@ -330,12 +344,11 @@ impl AppState {
         })
         .detach();
 
-        let config = SyncConfig::load();
         let window_handle = window.window_handle();
         let mut app = Self {
-            sync,
-            tags,
-            notes,
+            store,
+            startup_error,
+            notes: Vec::new(),
             selected_id: None,
             editor: None,
             scroll: ScrollHandle::new(),
@@ -349,14 +362,15 @@ impl AppState {
             save_epoch: 0,
             current_stats: (0, 0),
             last_saved_md: None,
-            last_saved_plum: None,
             pending_save: None,
-            db_sig: None,
-            native_app_running: false,
-            poll_ticks: 0,
+            next_backup_check: Instant::now(),
             config,
             show_settings: false,
             settings: None,
+            storage_note: None,
+            pending_adopt: None,
+            picking_folder: false,
+            store_generation: 0,
             webdav_test: WebDavTest::Idle,
             webdav_syncing: false,
             webdav_message: None,
@@ -373,36 +387,107 @@ impl AppState {
             title_input: None,
             window_handle,
             md_tip: None,
+            md_tip_last: None,
+            md_tip_closed_at: None,
             md_tip_hover: None,
             md_tip_bounds: Rc::new(RefCell::new(HashMap::new())),
         };
 
-        app.reload_tags_cache();
-        app.prune_tag_orphans();
-        if !app.notes.is_empty() {
-            app.select_note_by_index(0, window, cx);
+        if app.startup_error.is_none() {
+            app.start_session(window, cx);
         }
-        app.start_auto_sync(window, cx);
-        // Pull WebDAV changes once at startup; silent when the server is not
-        // configured yet.
-        if app.config.webdav_auto && app.config.webdav_configured() {
-            app.start_webdav_sync(window, cx, false);
-        }
+        app.start_background_loop(window, cx);
         app
+    }
+
+    /// Everything that follows opening a database: carry over the previous
+    /// layout on first use, show the notes and start syncing.
+    fn start_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.migrate_legacy_data();
+        self.show_store_contents(window, cx);
+        // Pull WebDAV changes right away; silent when the server is not
+        // configured yet.
+        if self.config.webdav_auto && self.config.webdav_configured() {
+            self.start_webdav_sync(window, cx, false);
+        }
+    }
+
+    /// First start with the app's own database: move in the notes of Windows
+    /// Sticky Notes plus the Markdown, tags and pins earlier versions kept
+    /// beside them. Nothing is deleted or changed at the old places.
+    fn migrate_legacy_data(&mut self) {
+        // Once per machine: a database created later (for instance after
+        // choosing the default folder again) must start empty rather than
+        // bring back notes that were deleted here since the migration.
+        if self.config.legacy_migrated {
+            return;
+        }
+        match legacy::migrate_once(&self.store, &legacy::LegacySources::detect()) {
+            Ok(report) => {
+                if let Some(report) = report {
+                    debug_log(&format!(
+                        "migrated notes={} tags={} links={} pins={} windows_found={} tags_unreadable={}",
+                        report.notes.added,
+                        report.tags.tags,
+                        report.tags.links,
+                        report.tags.pins,
+                        report.windows_notes_found,
+                        report.tags_unreadable
+                    ));
+                    let moved = format!(
+                        "已从 Windows 便签迁移 {} 条便签到独立数据库",
+                        report.notes.added
+                    );
+                    if report.tags_unreadable {
+                        self.storage_note = Some(StorageNote::Error(format!(
+                            "{moved}；旧的标签文件无法读取，标签和置顶没有迁移"
+                        )));
+                    } else if report.notes.added > 0 {
+                        self.storage_note = Some(StorageNote::Info(moved));
+                    }
+                }
+                self.config.legacy_migrated = true;
+                if let Err(e) = self.config.save() {
+                    debug_log(&format!("saving the migration flag failed: {e}"));
+                }
+            }
+            Err(e) => {
+                debug_log(&format!("migration failed: {e}"));
+                let msg = format!("迁移 Windows 便签失败，下次启动会重试：{e}");
+                self.status = SyncStatus::Error(msg.clone());
+                self.storage_note = Some(StorageNote::Error(msg));
+            }
+        }
+    }
+
+    /// Load the list, tags and pins from `store` and open the first note.
+    fn show_store_contents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_selection();
+        self.pending_save = None;
+        match self.store.list_notes() {
+            Ok(notes) => self.notes = notes,
+            Err(e) => {
+                self.notes.clear();
+                self.status = SyncStatus::Error(format!("读取便签失败：{e}"));
+            }
+        }
+        self.reload_tags_cache();
+        self.select_note_by_index(0, window, cx);
+        cx.notify();
     }
 
     /// Refresh in-memory tag cache with a single batch query.
     pub fn reload_tags_cache(&mut self) {
-        let tags = self.tags.list_tags().unwrap_or_default();
+        let tags = self.store.list_tags().unwrap_or_default();
         let tag_map: HashMap<i64, Tag> = tags.iter().map(|t| (t.id, t.clone())).collect();
 
-        let pairs = self.tags.all_note_tags().unwrap_or_default();
+        let pairs = self.store.note_tags().unwrap_or_default();
         let mut note_tags: HashMap<String, Vec<Tag>> = HashMap::new();
         let mut counts: HashMap<i64, usize> = HashMap::new();
 
-        for (guid, tid) in pairs {
+        for (note_id, tid) in pairs {
             if let Some(tag) = tag_map.get(&tid) {
-                note_tags.entry(guid).or_default().push(tag.clone());
+                note_tags.entry(note_id).or_default().push(tag.clone());
                 *counts.entry(tid).or_default() += 1;
             }
         }
@@ -411,8 +496,8 @@ impl AppState {
         self.note_tags_map = note_tags;
         self.tag_counts = counts;
         self.pinned = self
-            .tags
-            .pinned_guids()
+            .store
+            .pinned_ids()
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -436,8 +521,9 @@ impl AppState {
     }
 
     pub fn current_theme(&self) -> &'static ThemeSpec {
-        let theme_name = self.current_note().and_then(|n| n.theme.as_deref());
-        get_theme(theme_name)
+        self.current_note()
+            .map(|n| get_theme(&n.theme))
+            .unwrap_or(&THEMES[0])
     }
 
     pub fn filtered_notes(&self) -> Vec<NoteSummary> {
@@ -469,16 +555,21 @@ impl AppState {
         notes
     }
 
+    /// Close the open note without saving it. Callers that may hold unsaved
+    /// edits flush them first.
+    fn clear_selection(&mut self) {
+        self.selected_id = None;
+        self.editor = None;
+        self.title_input = None;
+        self.last_saved_md = None;
+        self.current_stats = (0, 0);
+    }
+
     pub fn ensure_selection_after_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let filtered = self.filtered_notes();
         if filtered.is_empty() {
             self.flush_pending_save(cx);
-            self.selected_id = None;
-            self.editor = None;
-            self.title_input = None;
-            self.last_saved_md = None;
-            self.last_saved_plum = None;
-            self.current_stats = (0, 0);
+            self.clear_selection();
         } else if !filtered.iter().any(|n| Some(&n.id) == self.selected_id.as_ref()) {
             self.select_note_by_index(0, window, cx);
         }
@@ -493,19 +584,10 @@ impl AppState {
         // timer fires against the *new* editor and the edit is silently lost.
         self.flush_pending_save(cx);
 
-        let Some(plum_text) = self.sync.plum.get_note_text(id).ok().flatten() else {
+        let Some(md) = self.store.note_markdown(id).ok().flatten() else {
             return;
         };
-        // Prefer our full-fidelity copy: plum cannot hold headings, fences,
-        // tables and so on, so converting back would strip the formatting.
-        let stored = self.sync.note_markdown(id, &plum_text);
-        let md = stored.clone().unwrap_or_else(|| markup::plum_to_markdown(&plum_text));
-        debug_log(&format!(
-            "select id={} len={} shadow={}",
-            short_id(id),
-            md.len(),
-            stored.is_some()
-        ));
+        debug_log(&format!("select id={} len={}", short_id(id), md.len()));
         // The first paragraph is the note title; the rest is the body.
         let (title, body) = Self::split_title_body(&md);
         let scroll = self.scroll.clone();
@@ -553,12 +635,10 @@ impl AppState {
         self.editor = Some(editor);
         self.title_input = Some(title_input);
         self.selected_id = Some(id.to_string());
-        self.pending_save = None;
-        // Store the composed document (title + body): the auto-sync check
-        // compares it against `compose_md` later. `last_saved_plum` is the
-        // exact row text we loaded, so a poll can recognise it as unchanged.
+        // Store the composed document (title + body): it is what the editor
+        // would write back, so comparing against it later tells whether the
+        // user changed anything.
         self.last_saved_md = Some(self.compose_md(cx));
-        self.last_saved_plum = Some(plum_text);
         self.update_stats_from_editor(cx);
         cx.notify();
     }
@@ -575,19 +655,13 @@ impl AppState {
     /// first paragraph is the note title, matching Windows Sticky Notes.
     fn split_title_body(md: &str) -> (String, String) {
         match md.split_once('\n') {
-            Some((first, rest)) => (
-                stickynotes_core::store::strip_markdown_syntax(first),
-                rest.to_string(),
-            ),
-            None => (
-                stickynotes_core::store::strip_markdown_syntax(md),
-                String::new(),
-            ),
+            Some((first, rest)) => (store::strip_markdown_syntax(first), rest.to_string()),
+            None => (store::strip_markdown_syntax(md), String::new()),
         }
     }
 
     /// Compose the title field and body editor back into one markdown
-    /// document — the form written to plum and compared by auto-sync.
+    /// document — the form written to the database.
     pub fn compose_md(&self, cx: &App) -> String {
         let body = self
             .editor
@@ -683,49 +757,33 @@ impl AppState {
         }
         let md = self.compose_md(cx);
         debug_log(&format!("save id={} len={}", short_id(&id), md.len()));
-        match self.sync.save_note(&id, &md) {
-            Ok((plum_text, updated_at)) => {
-                // Did the row actually keep our text, and does the Markdown
-                // survive a plum round trip? (No note content is logged.)
-                let stick = self.sync.plum.get_note_text(&id).ok().flatten().as_deref()
-                    == Some(plum_text.as_str());
-                let rt = markup::plum_to_markdown(&plum_text);
-                debug_log(&format!(
-                    "save ok stick={stick} rt_eq={} md={} rt={}",
-                    rt == md,
-                    md.len(),
-                    rt.len()
-                ));
+        match self.store.save_markdown(&id, &md) {
+            Ok(updated_at) => {
                 self.status = SyncStatus::Saved("已自动保存".into());
                 self.last_saved_md = Some(md.clone());
-                self.last_saved_plum = Some(plum_text);
                 self.pending_save = None;
-                // Our own write must not look like an external change.
-                self.refresh_db_sig();
                 if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
-                    note.updated_at = Some(updated_at);
+                    note.updated_at = updated_at;
                 }
                 debug_log("save ok");
             }
             Err(e) => {
-                let msg = format!("{e}");
-                // The Windows app may hold the write lock for a moment; the
-                // background poll retries the exact text that failed instead
-                // of losing the edit.
-                let retryable = msg.contains("locked") || msg.contains("busy");
+                // Another program may hold the database lock for a moment;
+                // the background loop retries the exact text that failed
+                // instead of losing the edit.
+                let retryable = e.is_busy();
                 self.pending_save = retryable.then(|| (id.clone(), md.clone()));
                 self.status = if retryable {
                     SyncStatus::Busy("数据库被占用，正在自动重试保存…".into())
                 } else {
-                    SyncStatus::Error(msg.clone())
+                    SyncStatus::Error(format!("保存失败：{e}"))
                 };
-                debug_log(&format!("save err retryable={retryable} msg={msg}"));
+                debug_log(&format!("save err retryable={retryable} msg={e}"));
             }
         }
 
         // Direct in-memory summary update (no full disk reload)
-        let plum_text = markup::markdown_to_plum(&md);
-        let (title, snippet) = stickynotes_core::store::extract_title_and_snippet(&plum_text);
+        let (title, snippet) = store::title_and_snippet(&md);
         if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
             note.title = title;
             note.snippet = snippet;
@@ -735,18 +793,16 @@ impl AppState {
     }
 
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.sync.create_note("", "Yellow") {
+        match self.store.create_note("", "Yellow") {
             Ok(new_id) => {
-                if let Ok(notes) = self.sync.reload() {
+                if let Ok(notes) = self.store.list_notes() {
                     self.notes = notes;
                 }
-                self.refresh_db_sig();
-                self.prune_tag_orphans();
                 self.select_note(&new_id, window, cx);
                 self.status = SyncStatus::Saved("已新建便签".into());
             }
             Err(e) => {
-                self.status = SyncStatus::Error(format!("{e}"));
+                self.status = SyncStatus::Error(format!("新建便签失败：{e}"));
             }
         }
         cx.notify();
@@ -762,19 +818,15 @@ impl AppState {
     /// Delete an arbitrary note — used by the card context menu, where the
     /// target is not necessarily the selected note.
     pub fn delete_note_by_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // Deleting the open note drops its pending debounce; writing it after
-        // the soft delete would bump UpdatedAt on a tombstone. Deleting another
-        // note flushes the open one so no edit is lost.
+        // Deleting the open note drops its pending debounce: there is nothing
+        // left to save it into. Deleting another note flushes the open one
+        // (in `reload`) so no edit is lost.
         if self.selected_id.as_deref() == Some(id) {
             self.save_epoch = self.save_epoch.wrapping_add(1);
             self.pending_save = None;
-            self.selected_id = None;
-            self.editor = None;
-            self.title_input = None;
-            self.last_saved_md = None;
-            self.last_saved_plum = None;
+            self.clear_selection();
         }
-        match self.sync.delete_note(id) {
+        match self.store.soft_delete(id) {
             Ok(()) => {
                 // Remember the deletion so the remote `.md` goes away too;
                 // otherwise the next WebDAV pass would happily re-import the
@@ -789,7 +841,7 @@ impl AppState {
                 self.schedule_webdav_sync(window, cx);
             }
             Err(e) => {
-                self.status = SyncStatus::Error(format!("{e}"));
+                self.status = SyncStatus::Error(format!("删除失败：{e}"));
                 cx.notify();
             }
         }
@@ -797,12 +849,11 @@ impl AppState {
 
     pub fn set_theme(&mut self, theme: &str, cx: &mut Context<Self>) {
         let Some(id) = self.selected_id.clone() else { return };
-        match self.sync.plum.set_theme(&id, theme) {
+        match self.store.set_theme(&id, theme) {
             Ok(()) => {
                 self.status = SyncStatus::Saved(format!("颜色已设为 {theme}"));
-                self.refresh_db_sig();
                 if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
-                    note.theme = Some(theme.to_string());
+                    note.theme = theme.to_string();
                 }
             }
             Err(e) => self.status = SyncStatus::Error(format!("{e}")),
@@ -825,51 +876,26 @@ impl AppState {
         cx.notify();
     }
 
-    /// Push local changes through the native app's Microsoft sync. Kept for
-    /// the Microsoft toggle path; the top-bar button is gone.
-    #[allow(dead_code)]
-    pub fn cloud_sync(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.save_current(cx);
-        if sync::is_sticky_notes_running() {
-            self.status =
-                SyncStatus::Busy("Windows 便签已打开，正在上传本地修改…".into());
-            cx.notify();
-            return;
-        }
-        self.status = SyncStatus::Busy("已打开 Windows 便签，正在上传本地修改…".into());
-        let _ = sync::launch_sticky_notes();
-        cx.notify();
-    }
-
+    /// Re-read the list, tags and pins from the database, keeping the open
+    /// note open when it is still there.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_pending_save(cx);
-        match self.sync.reload() {
+        match self.store.list_notes() {
             Ok(notes) => {
                 self.notes = notes;
                 self.status = SyncStatus::Saved("已刷新".into());
-                self.refresh_db_sig();
             }
-            Err(e) => self.status = SyncStatus::Error(format!("{e}")),
+            Err(e) => self.status = SyncStatus::Error(format!("读取便签失败：{e}")),
         }
         self.reload_tags_cache();
-        self.prune_tag_orphans();
-        let keep = self.selected_id.clone();
-        self.selected_id = None;
-        self.editor = None;
-        self.last_saved_plum = None;
-        if !self.notes.is_empty() {
-            let idx = keep
-                .and_then(|id| self.notes.iter().position(|n| n.id == id))
-                .unwrap_or(0);
-            self.select_note_by_index(idx, window, cx);
+        let keep = self.selected_id.take();
+        self.clear_selection();
+        let visible = self.filtered_notes();
+        match keep.filter(|id| visible.iter().any(|n| &n.id == id)) {
+            Some(id) => self.select_note(&id, window, cx),
+            None => self.select_note_by_index(0, window, cx),
         }
         cx.notify();
-    }
-
-    fn prune_tag_orphans(&mut self) {
-        let guids: Vec<String> = self.notes.iter().map(|n| n.id.clone()).collect();
-        let _ = self.tags.prune_orphans(&guids);
-        self.reload_tags_cache();
     }
 
     // --- Tag management ---
@@ -895,10 +921,10 @@ impl AppState {
         if name.is_empty() {
             return;
         }
-        match self.tags.create_tag(&name) {
+        match self.store.create_tag(&name) {
             Ok(tid) => {
                 if let Some(id) = &self.selected_id {
-                    let _ = self.tags.tag_note(id, tid);
+                    let _ = self.store.tag_note(id, tid);
                 }
                 input.update(cx, |s, cx| s.set_value("", window, cx));
                 self.status = SyncStatus::Saved(format!("标签 #{name} 已添加"));
@@ -913,12 +939,16 @@ impl AppState {
     }
 
     pub fn delete_tag(&mut self, id: i64, cx: &mut Context<Self>) {
-        let _ = self.tags.delete_tag(id);
-        if self.tag_filter == Some(id) {
-            self.tag_filter = None;
+        match self.store.delete_tag(id) {
+            Ok(()) => {
+                if self.tag_filter == Some(id) {
+                    self.tag_filter = None;
+                }
+                self.status = SyncStatus::Saved("标签已删除".into());
+            }
+            Err(e) => self.status = SyncStatus::Error(format!("{e}")),
         }
         self.reload_tags_cache();
-        self.status = SyncStatus::Saved("标签已删除".into());
         cx.notify();
     }
 
@@ -932,9 +962,9 @@ impl AppState {
             .unwrap_or(false);
 
         let result = if has {
-            self.tags.untag_note(note_id, tag_id)
+            self.store.untag_note(note_id, tag_id)
         } else {
-            self.tags.tag_note(note_id, tag_id)
+            self.store.tag_note(note_id, tag_id)
         };
         if let Err(e) = result {
             self.status = SyncStatus::Error(format!("{e}"));
@@ -948,7 +978,7 @@ impl AppState {
 
     pub fn toggle_pin(&mut self, note_id: &str, cx: &mut Context<Self>) {
         let pin = !self.pinned.contains(note_id);
-        match self.tags.set_pinned(note_id, pin) {
+        match self.store.set_pinned(note_id, pin) {
             Ok(()) => {
                 if pin {
                     self.pinned.insert(note_id.to_string());
@@ -963,17 +993,11 @@ impl AppState {
         cx.notify();
     }
 
-    // --- Automatic sync ---
+    // --- Background loop ---
 
-    fn refresh_db_sig(&mut self) {
-        self.db_sig = Some(plum_signature(self.sync.plum.path()));
-    }
-
-    /// Background loop: every 2s, notice writes made by the Windows Sticky
-    /// Notes app and load them without a manual refresh; also retries a save
-    /// that failed because the database was momentarily locked.
-    fn start_auto_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_db_sig();
+    /// Every 2s: retry a save that hit a locked database, take a backup when
+    /// one is due and start the periodic WebDAV pull.
+    fn start_background_loop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
         window
             .spawn(cx, async move |cx: &mut AsyncWindowContext| {
@@ -982,20 +1006,7 @@ impl AppState {
                         .timer(Duration::from_millis(2000))
                         .await;
                     if this
-                        .update_in(cx, |this, window, cx| {
-                            this.poll_external_changes(window, cx);
-                            // Background WebDAV pull. With the version cache a
-                            // quiet pass is a single PROPFIND per minute; when
-                            // the server is failing, the interval backs off so
-                            // it is not hammered. Local edits still upload via
-                            // the 2.5s debounce instead of waiting for this.
-                            if this.config.webdav_auto
-                                && !this.webdav_syncing
-                                && Instant::now() >= this.webdav_next_try
-                            {
-                                this.start_webdav_sync(window, cx, false);
-                            }
-                        })
+                        .update_in(cx, |this, window, cx| this.background_tick(window, cx))
                         .is_err()
                     {
                         break;
@@ -1005,12 +1016,72 @@ impl AppState {
             .detach();
     }
 
-    // --- Settings dialog & WebDAV sync ---
+    fn background_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.startup_error.is_some() {
+            return;
+        }
+        self.retry_pending_save(cx);
+
+        if Instant::now() >= self.next_backup_check {
+            self.next_backup_check = Instant::now() + Duration::from_secs(30 * 60);
+            match backup::backup_if_due(&self.store, &backup::default_dir()) {
+                Ok(written) => debug_log(&format!("backup written={}", written.is_some())),
+                // Backups are a safety net; the notes themselves are saved.
+                Err(e) => debug_log(&format!("backup failed: {e}")),
+            }
+        }
+
+        // Background WebDAV pull. With the version cache a quiet pass is a
+        // single PROPFIND per minute; when the server is failing, the interval
+        // backs off so it is not hammered. Local edits still upload via the
+        // 2.5s debounce instead of waiting for this.
+        if self.config.webdav_auto
+            && self.config.webdav_configured()
+            && !self.webdav_syncing
+            && Instant::now() >= self.webdav_next_try
+        {
+            self.start_webdav_sync(window, cx, false);
+        }
+    }
+
+    /// Retry the exact text that failed, even if the selection has moved on
+    /// since — never the current editor's content, which belongs to another note.
+    fn retry_pending_save(&mut self, cx: &mut Context<Self>) {
+        let Some((id, md)) = self.pending_save.clone() else {
+            return;
+        };
+        match self.store.save_markdown(&id, &md) {
+            Ok(updated_at) => {
+                self.pending_save = None;
+                if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
+                    note.updated_at = updated_at;
+                }
+                if self.selected_id.as_deref() == Some(id.as_str()) {
+                    self.last_saved_md = Some(md);
+                }
+                self.status = SyncStatus::Saved("已自动保存".into());
+                debug_log("retry save ok");
+                cx.notify();
+            }
+            Err(e) if e.is_busy() => debug_log("retry save busy"),
+            Err(e) => {
+                // Not a lock any more (the note is gone, the disk is full, …):
+                // retrying the same write cannot succeed.
+                self.pending_save = None;
+                self.status = SyncStatus::Error(format!("保存失败：{e}"));
+                debug_log(&format!("retry save err msg={e}"));
+                cx.notify();
+            }
+        }
+    }
+
+    // --- Settings dialog ---
 
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_settings_inputs(window, cx);
         self.show_settings = true;
         self.webdav_test = WebDavTest::Idle;
+        self.pending_adopt = None;
         if let Some(s) = &self.settings {
             let handle = s.url.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
@@ -1081,8 +1152,19 @@ impl AppState {
     }
 
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_settings {
+            return;
+        }
         self.persist_settings(cx);
         self.show_settings = false;
+        self.pending_adopt = None;
+        // Return focus from the unmounting modal fields back to the open note.
+        if let Some(editor) = &self.editor {
+            let handle = editor.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        } else {
+            window.blur(cx);
+        }
         // A fresh configuration is worth an immediate (debounced) sync.
         self.schedule_webdav_sync(window, cx);
         cx.notify();
@@ -1099,15 +1181,255 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn set_microsoft_sync(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.config.microsoft = on;
-        let _ = self.config.save();
-        if !on {
-            // No longer following the native app; forget its state.
-            self.native_app_running = false;
+    // --- Settings: where the database lives ---
+
+    /// The database file in use, for display.
+    pub fn database_path(&self) -> &Path {
+        self.store.path()
+    }
+
+    /// Show the database file in Explorer.
+    pub fn reveal_database(&mut self, cx: &mut Context<Self>) {
+        cx.reveal_path(self.store.path());
+    }
+
+    /// Let the user pick the folder the database should live in.
+    pub fn choose_data_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picking_folder {
+            return;
+        }
+        self.picking_folder = true;
+        self.pending_adopt = None;
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择此文件夹".into()),
+        });
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                let picked = picked.await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.picking_folder = false;
+                    match picked {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(dir) = paths.into_iter().next() {
+                                this.request_data_folder(dir, window, cx);
+                            }
+                        }
+                        // Cancelled.
+                        Ok(Ok(None)) | Err(_) => {}
+                        Ok(Err(e)) => {
+                            this.storage_note =
+                                Some(StorageNote::Error(format!("无法打开文件夹选择框：{e}")));
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Move the database back to the default app-data folder.
+    pub fn restore_default_data_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_data_folder(config::default_data_dir(), window, cx);
+    }
+
+    /// `dir` was chosen as the data folder: move the database there, or — if
+    /// one already exists there — ask before switching to it.
+    fn request_data_folder(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let target = config::database_path_in(&dir);
+        if same_file(&target, self.store.path()) {
+            self.pending_adopt = None;
+            self.storage_note = Some(StorageNote::Info("数据库已经在这个位置".into()));
+        } else if target.exists() {
+            // Never overwrite a database: offer to use it instead.
+            self.storage_note = None;
+            self.pending_adopt = Some(dir);
+        } else {
+            self.pending_adopt = None;
+            self.move_database(&dir, window, cx);
         }
         cx.notify();
     }
+
+    /// Unsaved text of the open note must be in the database before the
+    /// database is copied or left behind.
+    fn saved_before_switch(&mut self, cx: &mut Context<Self>) -> bool {
+        self.flush_pending_save(cx);
+        self.retry_pending_save(cx);
+        if self.pending_save.is_some() {
+            self.storage_note = Some(StorageNote::Error(
+                "当前便签还没有保存成功（数据库被占用），请稍后再试".into(),
+            ));
+            return false;
+        }
+        true
+    }
+
+    /// Point the config at `dir`, undoing the change when it cannot be saved:
+    /// otherwise the next start would open the database in the old place.
+    fn remember_data_folder(&mut self, dir: &Path) -> std::io::Result<()> {
+        let previous = self.config.data_dir.clone();
+        self.config.set_data_dir(dir);
+        self.config.save().inspect_err(|_| self.config.data_dir = previous)
+    }
+
+    /// Move the database file into `dir`: copy, verify, switch over, and only
+    /// then delete the old file.
+    fn move_database(&mut self, dir: &Path, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.saved_before_switch(cx) {
+            return;
+        }
+        let target = config::database_path_in(dir);
+        let moved = match self.store.copy_and_open(&target) {
+            Ok(store) => store,
+            Err(e) => {
+                self.storage_note = Some(StorageNote::Error(format!(
+                    "移动失败，数据库仍在原位置：{e}"
+                )));
+                return;
+            }
+        };
+        if let Err(e) = self.remember_data_folder(dir) {
+            drop(moved);
+            let _ = store::remove_database_files(&target);
+            self.storage_note = Some(StorageNote::Error(format!(
+                "保存设置失败，数据库仍在原位置：{e}"
+            )));
+            return;
+        }
+
+        // Same notes at a new address: the list, the open editor and the
+        // WebDAV bookkeeping all stay valid.
+        let old = std::mem::replace(&mut self.store, moved);
+        let old_path = old.path().to_path_buf();
+        drop(old); // closes the old file so it can be deleted
+        self.storage_note = Some(match store::remove_database_files(&old_path) {
+            Ok(()) => StorageNote::Info("数据库已移动到新位置".into()),
+            Err(e) => StorageNote::Error(format!(
+                "数据库已移动到新位置，但旧文件没能删除（{e}）：{}",
+                old_path.display()
+            )),
+        });
+        debug_log("database moved");
+    }
+
+    /// The user confirmed switching to the database that already exists in
+    /// the picked folder. The current database stays where it is.
+    pub fn confirm_adopt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.pending_adopt.take() else {
+            return;
+        };
+        cx.notify();
+        if !self.saved_before_switch(cx) {
+            return;
+        }
+        let target = config::database_path_in(&dir);
+        let adopted = match NoteStore::open_existing(&target) {
+            Ok(store) => store,
+            Err(e) => {
+                self.storage_note =
+                    Some(StorageNote::Error(format!("无法使用该数据库：{e}")));
+                return;
+            }
+        };
+        if let Err(e) = self.remember_data_folder(&dir) {
+            self.storage_note = Some(StorageNote::Error(format!(
+                "保存设置失败，仍在使用原数据库：{e}"
+            )));
+            return;
+        }
+
+        let old_path = self.store.path().to_path_buf();
+        self.store = adopted;
+        // Different notes from here on: what a running sync pass computed and
+        // what the version cache remembers were about the previous database.
+        self.store_generation = self.store_generation.wrapping_add(1);
+        self.webdav_cache = webdav::SyncCache::default();
+        self.storage_note = Some(StorageNote::Info(format!(
+            "已改用所选文件夹中的数据库；原数据库仍保留在 {}",
+            old_path.display()
+        )));
+        debug_log("database adopted");
+        self.start_session(window, cx);
+    }
+
+    pub fn cancel_adopt(&mut self, cx: &mut Context<Self>) {
+        self.pending_adopt = None;
+        cx.notify();
+    }
+
+    /// Merge the notes of Windows Sticky Notes into the database (read-only
+    /// on their side): new notes are added, notes edited there since the last
+    /// import are updated, nothing is deleted.
+    pub fn import_from_windows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.notify();
+        let sources = legacy::LegacySources::detect();
+        let Some(plum) = sources.plum.clone() else {
+            self.storage_note = Some(StorageNote::Error(
+                "没有找到 Windows 便签的数据（未安装或从未打开过“便签”应用）".into(),
+            ));
+            return;
+        };
+        if !self.saved_before_switch(cx) {
+            return;
+        }
+        match import::import_from_windows(&self.store, &plum, &sources.shadow_markdown()) {
+            Ok(report) => {
+                debug_log(&format!(
+                    "import added={} updated={} unchanged={}",
+                    report.added, report.updated, report.unchanged
+                ));
+                self.storage_note =
+                    Some(StorageNote::Info(format!("导入完成：{}", report.summary())));
+                if report.changed() {
+                    self.reload(window, cx);
+                    self.schedule_webdav_sync(window, cx);
+                }
+            }
+            Err(e) => {
+                self.storage_note = Some(StorageNote::Error(format!("导入失败：{e}")));
+            }
+        }
+    }
+
+    // --- Recovery screen (the database could not be opened) ---
+
+    /// Try the configured location again, e.g. after reconnecting a drive.
+    pub fn retry_open_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match open_configured_database(&self.config) {
+            Ok(store) => {
+                self.store = store;
+                self.startup_error = None;
+                self.start_session(window, cx);
+            }
+            Err(e) => self.startup_error = Some(e.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// Give up on the custom folder and use the default one. The database in
+    /// the custom folder is not touched.
+    pub fn use_default_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(e) = self.remember_data_folder(&config::default_data_dir()) {
+            self.startup_error = Some(format!("保存设置失败：{e}"));
+            cx.notify();
+            return;
+        }
+        self.retry_open_database(window, cx);
+    }
+
+    /// Open the folder that holds the automatic database snapshots.
+    pub fn reveal_backups(&mut self, cx: &mut Context<Self>) {
+        let dir = backup::default_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        cx.open_with_system(&dir);
+    }
+
+    // --- WebDAV sync ---
 
     pub fn test_webdav(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.persist_settings(cx);
@@ -1177,11 +1499,23 @@ impl AppState {
         // Make sure the note being edited is on disk before we snapshot.
         self.flush_pending_save(cx);
 
+        // An incomplete snapshot would make missing notes look deleted or
+        // remote-only, so a failed read skips this pass instead.
+        let notes = match self.local_sync_notes() {
+            Ok(notes) => notes,
+            Err(e) => {
+                self.webdav_next_try = Instant::now() + Duration::from_secs(30);
+                self.webdav_message = Some(format!("同步失败：{e}"));
+                self.status = SyncStatus::Error(format!("WebDAV 同步失败：{e}"));
+                cx.notify();
+                return;
+            }
+        };
+
         self.webdav_syncing = true;
         self.webdav_pending = false;
         self.webdav_message = Some("正在同步…".into());
         let cfg = self.config.webdav.clone();
-        let notes = self.local_sync_notes(cx);
         let cache = if force {
             webdav::SyncCache::default()
         } else {
@@ -1189,6 +1523,7 @@ impl AppState {
         };
         let ensure_dir = force || !self.webdav_dir_ready;
         let ledger = self.webdav_deletions.clone();
+        let generation = self.store_generation;
         let this = cx.weak_entity();
         cx.notify();
 
@@ -1202,7 +1537,7 @@ impl AppState {
                     })
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.finish_webdav_sync(result, window, cx);
+                    this.finish_webdav_sync(result, generation, window, cx);
                 });
             })
             .detach();
@@ -1230,43 +1565,55 @@ impl AppState {
             .detach();
     }
 
-    fn local_sync_notes(&self, _cx: &App) -> Vec<webdav::SyncNote> {
-        self.notes
-            .iter()
-            .filter_map(|note| {
-                let plum = self.sync.plum.get_note_text(&note.id).ok().flatten()?;
-                let md = self
-                    .sync
-                    .note_markdown(&note.id, &plum)
-                    .unwrap_or_else(|| markup::plum_to_markdown(&plum));
-                let (title, _) = Self::split_title_body(&md);
-                Some(webdav::SyncNote {
-                    id: note.id.clone(),
+    /// Every live note as WebDAV sees it.
+    fn local_sync_notes(&self) -> store::Result<Vec<webdav::SyncNote>> {
+        let notes = self.store.live_notes()?;
+        Ok(notes
+            .into_iter()
+            .map(|note| {
+                let (title, _) = Self::split_title_body(&note.markdown);
+                webdav::SyncNote {
                     title,
-                    color: note.theme.clone().unwrap_or_else(|| "Yellow".into()),
+                    color: note.theme,
                     tags: self
                         .tags_for_note(&note.id)
                         .iter()
                         .map(|t| t.name.clone())
                         .collect(),
                     pinned: self.is_pinned(&note.id),
-                    updated_at: note.updated_at.unwrap_or(0),
-                    markdown: md,
-                })
+                    updated_at: note.updated_at,
+                    markdown: note.markdown,
+                    id: note.id,
+                }
             })
-            .collect()
+            .collect())
     }
 
     fn finish_webdav_sync(
         &mut self,
         result: Result<webdav::SyncOutcome, String>,
+        generation: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.webdav_syncing = false;
+        if generation != self.store_generation {
+            // The database was switched while this pass ran: its decisions
+            // were made for other notes, so they are dropped. What it removed
+            // from the server is still a fact, though.
+            if let Ok(outcome) = result {
+                self.webdav_deletions = outcome.ledger;
+                let _ = self.webdav_deletions.save();
+            }
+            self.webdav_pending = false;
+            self.webdav_message = None;
+            self.schedule_webdav_sync(window, cx);
+            cx.notify();
+            return;
+        }
         match result {
             Ok(outcome) => {
-                self.webdav_cache = outcome.cache;
+                let previous_cache = std::mem::replace(&mut self.webdav_cache, outcome.cache);
                 let _ = self.webdav_cache.save();
                 self.webdav_deletions = outcome.ledger;
                 let _ = self.webdav_deletions.save();
@@ -1275,63 +1622,84 @@ impl AppState {
                 self.webdav_next_try = Instant::now() + Duration::from_secs(60);
 
                 let report = outcome.report;
-                if !report.deleted_local.is_empty() {
-                    // The file was removed on another device and this device
-                    // has no newer local edit: follow the deletion.
-                    for id in &report.deleted_local {
-                        let ok = self.sync.delete_note(id).is_ok();
-                        debug_log(&format!("webdav tombstone applied={} id={}", ok, short_id(id)));
-                        if ok {
-                            if self.selected_id.as_deref() == Some(id.as_str()) {
-                                self.selected_id = None;
-                                self.editor = None;
-                                self.title_input = None;
-                                self.last_saved_md = None;
-                                self.last_saved_plum = None;
-                            }
-                        }
-                    }
-                    let _ = self.tags.prune_orphans(
-                        &self.notes.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
-                    );
-                    // Refresh the list so the deleted notes disappear now.
-                    if let Ok(notes) = self.sync.reload() {
-                        self.notes = notes;
-                    }
-                    self.refresh_db_sig();
-                    self.reload_tags_cache();
-                    self.prune_tag_orphans();
-                    self.ensure_selection_after_filter(window, cx);
-                }
-                if !report.remote_notes.is_empty() {
-                    // Save local edits first; the remote note then wins only
-                    // where its `updated_at` is newer (decided by the sync).
+                debug_log(&format!(
+                    "webdav pass uploaded={} downloaded={} deleted_remote={} deleted_local={} unchanged={}",
+                    report.uploaded,
+                    report.downloaded,
+                    report.deleted_remote,
+                    report.deleted_local.len(),
+                    report.unchanged
+                ));
+                // The pass compared a snapshot taken when it started. Text
+                // typed since then must be on disk before its decisions are
+                // applied, so that newer local edits are recognised as such.
+                if !report.deleted_local.is_empty() || !report.remote_notes.is_empty() {
                     self.flush_pending_save(cx);
-                    for note in &report.remote_notes {
-                        if let Err(e) = self.sync.apply_remote_note(note) {
-                            self.status = SyncStatus::Error(format!("写入远端便签失败：{e}"));
-                            continue;
-                        }
-                        // Replace the local tag set and pin state with the remote.
-                        if let Ok(existing) = self.tags.tags_of_note(&note.id) {
-                            for tag_id in existing {
-                                let _ = self.tags.untag_note(&note.id, tag_id);
-                            }
-                        }
-                        for name in &note.tags {
-                            if let Ok(tag_id) = self.tags.create_tag(name) {
-                                let _ = self.tags.tag_note(&note.id, tag_id);
-                            }
-                        }
-                        let _ = self.tags.set_pinned(&note.id, note.pinned);
+                }
+                let mut changed = false;
+                let mut write_error = None;
+
+                for id in &report.deleted_local {
+                    // The file was removed on another device and this device
+                    // had no newer edit when the pass compared them: follow
+                    // the deletion — unless the note was edited meanwhile, in
+                    // which case it stays and the next pass uploads it.
+                    let last_synced = previous_cache
+                        .files
+                        .get(&format!("{id}.md"))
+                        .map(|file| file.updated_at);
+                    let current = self.notes.iter().find(|n| &n.id == id).map(|n| n.updated_at);
+                    if matches!((current, last_synced), (Some(now), Some(then)) if now > then) {
+                        debug_log(&format!("webdav tombstone skipped (edited) id={}", short_id(id)));
+                        continue;
                     }
-                    self.reload_tags_cache();
-                    self.prune_tag_orphans();
+                    match self.store.soft_delete(id) {
+                        Ok(()) => {
+                            debug_log(&format!("webdav tombstone applied id={}", short_id(id)));
+                            changed = true;
+                            if self.selected_id.as_deref() == Some(id.as_str()) {
+                                self.save_epoch = self.save_epoch.wrapping_add(1);
+                                self.clear_selection();
+                            }
+                        }
+                        Err(e) => write_error = Some(format!("删除便签失败：{e}")),
+                    }
+                }
+
+                for note in &report.remote_notes {
+                    // A note that became newer here while the pass ran keeps
+                    // its text (`apply_remote` returns false).
+                    let applied = self.store.apply_remote(&RemoteUpdate {
+                        id: &note.id,
+                        markdown: &note.markdown,
+                        theme: &note.color,
+                        updated_at: note.updated_at,
+                        tags: &note.tags,
+                        pinned: note.pinned,
+                    });
+                    match applied {
+                        Ok(applied) => {
+                            debug_log(&format!(
+                                "webdav remote applied={} id={}",
+                                applied,
+                                short_id(&note.id)
+                            ));
+                            changed |= applied;
+                        }
+                        Err(e) => write_error = Some(format!("写入远端便签失败：{e}")),
+                    }
+                }
+
+                if changed {
+                    // Show what arrived (or disappeared) right away.
                     self.reload(window, cx);
                 }
                 let summary = report.summary();
                 self.webdav_message = Some(summary.clone());
-                self.status = SyncStatus::Saved(summary);
+                self.status = match write_error {
+                    Some(e) => SyncStatus::Error(e),
+                    None => SyncStatus::Saved(summary),
+                };
             }
             Err(e) => {
                 self.webdav_failures = self.webdav_failures.saturating_add(1);
@@ -1349,126 +1717,6 @@ impl AppState {
             self.webdav_pending = false;
             self.schedule_webdav_sync(window, cx);
         }
-        cx.notify();
-    }
-
-    fn poll_external_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The native app's process state is cheap to check but not free
-        // (a tasklist spawn): refresh it every ~10s, not every poll.
-        self.poll_ticks = self.poll_ticks.wrapping_add(1);
-        if self.poll_ticks % 5 == 1 {
-            self.native_app_running = sync::is_sticky_notes_running();
-        }
-
-        // Retry the exact text that failed, even if the selection has moved on
-        // since — never the current editor's content, which belongs to another note.
-        if let Some((id, md)) = self.pending_save.clone() {
-            match self.sync.save_note(&id, &md) {
-                Ok((plum_text, updated_at)) => {
-                    self.pending_save = None;
-                    if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
-                        note.updated_at = Some(updated_at);
-                    }
-                    if self.selected_id.as_deref() == Some(id.as_str()) {
-                        self.last_saved_md = Some(md);
-                        self.last_saved_plum = Some(plum_text);
-                    }
-                    self.refresh_db_sig();
-                    self.status = SyncStatus::Saved("已自动保存".into());
-                    debug_log("retry save ok");
-                }
-                Err(_) => debug_log("retry save err"),
-            }
-        }
-
-        // Microsoft-account sync is opt-in: by default the companion app does
-        // not follow edits made in the native app or its cloud.
-        if !self.config.microsoft {
-            return;
-        }
-
-        let sig = plum_signature(self.sync.plum.path());
-        if self.db_sig == Some(sig) {
-            return;
-        }
-        self.db_sig = Some(sig);
-        debug_log(&format!("poll sig changed native={}", self.native_app_running));
-
-        let Ok(notes) = self.sync.reload() else {
-            return;
-        };
-
-        let selected = self.selected_id.clone();
-        let old_updated = selected
-            .as_deref()
-            .and_then(|id| self.notes.iter().find(|n| n.id == id))
-            .and_then(|n| n.updated_at);
-        let new_updated = selected
-            .as_deref()
-            .and_then(|id| notes.iter().find(|n| n.id == id))
-            .and_then(|n| n.updated_at);
-
-        self.notes = notes;
-
-        // The selected note was deleted in the Windows app.
-        if selected
-            .as_deref()
-            .is_some_and(|id| !self.notes.iter().any(|n| n.id == id))
-        {
-            self.selected_id = None;
-            self.editor = None;
-            self.title_input = None;
-            self.last_saved_md = None;
-            self.last_saved_plum = None;
-            self.ensure_selection_after_filter(window, cx);
-            self.status = SyncStatus::Saved("检测到外部删除，已自动更新列表".into());
-            cx.notify();
-            return;
-        }
-
-        if old_updated == new_updated {
-            // Only note metadata changed (e.g. a WAL checkpoint); the open
-            // note is unaffected.
-            cx.notify();
-            return;
-        }
-
-        // Refresh the open note, but only when the editor has no unsaved
-        // local edits — otherwise the debounced save owns the content.
-        if let (Some(id), Some(editor)) = (self.selected_id.clone(), self.editor.clone()) {
-            let local = self.compose_md(cx);
-            if self.last_saved_md.as_deref() == Some(local.as_str()) {
-                if let Ok(Some(plum_text)) = self.sync.plum.get_note_text(&id) {
-                    // If the row is byte-for-byte what we last wrote, this is
-                    // our own save seen back through the WAL: the Markdown after
-                    // a plum round trip is merely canonicalised, and replacing
-                    // the editor with it would look like the edit reverting.
-                    // Only a genuinely different row is an external write.
-                    let ours = self.last_saved_plum.as_deref() == Some(plum_text.as_str());
-                    let md = self
-                        .sync
-                        .note_markdown(&id, &plum_text)
-                        .unwrap_or_else(|| markup::plum_to_markdown(&plum_text));
-                    if !ours && md != local {
-                        let (title, body) = Self::split_title_body(&md);
-                        let ok = editor.update(cx, |state, cx| state.set_source(&body, cx).is_ok());
-                        if ok {
-                            if let Some(input) = &self.title_input {
-                                input.update(cx, |s, cx| s.set_value(title.clone(), window, cx));
-                            }
-                            // `set_value` emits Change; cancel the autosave it
-                            // scheduled — this content came from disk, not the user.
-                            self.save_epoch = self.save_epoch.wrapping_add(1);
-                            self.last_saved_md = Some(self.compose_md(cx));
-                            self.last_saved_plum = Some(plum_text);
-                            self.update_stats_from_editor(cx);
-                        }
-                    }
-                    debug_log(&format!("poll note ours={ours} md_eq={}", md == local));
-                }
-            }
-        }
-        self.status = SyncStatus::Saved("已自动同步 Windows 便签的修改".into());
         cx.notify();
     }
 }

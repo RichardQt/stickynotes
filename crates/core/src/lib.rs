@@ -1,9 +1,7 @@
-pub mod ticks;
+pub mod config;
 pub mod markup;
 pub mod store;
-pub mod tags;
-pub mod sync;
-pub mod config;
+pub mod ticks;
 pub mod webdav;
 
-pub use store::PlumStore;
+pub use store::NoteStore;

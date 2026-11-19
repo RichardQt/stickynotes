@@ -1,23 +1,28 @@
-//! Smoke test against the real plum.sqlite: list notes, convert to markdown,
-//! convert back, and diff the round trip.
+//! Smoke test against the real Windows Sticky Notes database (read-only):
+//! list its notes, convert them to Markdown and back, and report any drift.
 
-use stickynotes_core::{markup, store::PlumStore};
+use stickynotes_core::{
+    markup,
+    store::{plum, title_and_snippet},
+};
 
 fn main() -> anyhow::Result<()> {
-    let store = PlumStore::open()?;
-    println!("plum: {}", store.path().display());
+    let Some(path) = plum::find_plum_path() else {
+        anyhow::bail!("未找到 Windows 便签的数据库（plum.sqlite）");
+    };
+    println!("plum: {}", path.display());
 
-    let notes = store.list_notes()?;
+    let notes = plum::read_live_notes(&path)?;
     println!("{} active notes", notes.len());
     for n in notes.iter().take(3) {
-        println!("  [{}] {} ({})", &n.id[..8], n.title, n.theme.as_deref().unwrap_or("-"));
+        let (title, _) = title_and_snippet(&markup::plum_to_markdown(&n.text));
+        println!("  [{}] {} ({})", &n.id[..8], title, n.theme.as_deref().unwrap_or("-"));
     }
 
     // Round-trip check on every note
     let mut lossy = 0usize;
     for n in &notes {
-        let Some(plum_text) = store.get_note_text(&n.id)? else { continue };
-        let md = markup::plum_to_markdown(&plum_text);
+        let md = markup::plum_to_markdown(&n.text);
         let back = markup::markdown_to_plum(&md);
         let md2 = markup::plum_to_markdown(&back);
         if md != md2 {

@@ -1,5 +1,10 @@
 //! plum markup <-> Markdown conversion.
 //!
+//! plum is the text format of Windows Sticky Notes. The app stores Markdown
+//! and only meets plum when importing from the native app (plum -> Markdown);
+//! Markdown -> plum is kept to recognise a native row that still says what
+//! one of our notes says.
+//!
 //! plum text format (per paragraph, separated by `\n`):
 //!   `\id=<GUID>` — paragraph id prefix
 //!   `\b ... \b0` — bold run
@@ -8,7 +13,7 @@
 //!   `\l0 `       — list continuation (indented) line
 //!   `​`      — zero-width space, stripped on import
 //!
-//! Lossy mapping (plum is the source of truth, Markdown is the projection):
+//! Markdown -> plum is lossy, because plum has no such concepts:
 //!   `# heading` -> plain paragraph without `#`
 //!   fenced code block -> line-by-line plain paragraphs
 //!   tables/links -> kept as raw Markdown text
