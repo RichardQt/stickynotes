@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod quick_note;
+mod settings_ui;
 mod state;
 mod ui;
+mod win;
 
 use gpui_kit::*;
 
@@ -36,6 +39,13 @@ fn main() {
         }
     }));
 
+    // One instance per profile. A second start only brings the running one
+    // to the front: two would write the same database and sync it twice, and
+    // with "stay in the notification area" the first is easy to forget.
+    if !win::claim_single_instance() {
+        return;
+    }
+
     // Register the bundled Lucide icon set. Without an AssetSource every
     // `IconName` (window controls, search, pin, tag icons…) resolves to a
     // missing path and renders as nothing. `AllAssets` embeds the complete
@@ -46,8 +56,12 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             markdown_editor::init(cx);
+            // The app does not end with its last visible window: the main
+            // window may only be hidden in the notification area, and the
+            // quick note is a window of its own that stays around.
+            cx.set_quit_mode(QuitMode::Explicit);
 
-            gpui_kit::open_window(
+            let (main, _) = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Point { x: px(120.), y: px(80.) },
@@ -66,5 +80,15 @@ fn main() {
                 |window, cx| cx.new(|cx| state::AppState::new(window, cx)),
             )
             .expect("failed to open window");
+
+            // A main window that really closed is the end of the app, even
+            // while the (hidden) quick-note window still exists.
+            let main_id = main.window_id();
+            cx.on_window_closed(move |cx, id| {
+                if id == main_id {
+                    cx.quit();
+                }
+            })
+            .detach();
         });
 }

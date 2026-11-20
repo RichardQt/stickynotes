@@ -1,11 +1,13 @@
 //! WebDAV client and bidirectional Markdown sync.
 //!
 //! Every note lives remotely as `<note_id>.md` with a small YAML frontmatter
-//! block (id, title, color, tags, pinned, updated_at) followed by the note body
-//! as plain Markdown, so the files stay readable in any Markdown editor.
+//! block (id, title, color, tags, pinned, updated_at and, once the colour,
+//! tags or pin changed on their own, meta_updated_at) followed by the note
+//! body as plain Markdown, so the files stay readable in any Markdown editor.
 //!
-//! Conflicts are resolved by `updated_at` (latest wins); the sync touches only
-//! files whose content actually differs.
+//! Conflicts are resolved per note by its version, the later of the two
+//! timestamps (latest wins); the sync touches only files whose content
+//! actually differs.
 
 use crate::config::WebDavConfig;
 use crate::ticks;
@@ -35,8 +37,17 @@ pub struct SyncNote {
     pub pinned: bool,
     /// .NET ticks, same unit as the note database's `updated_at` column.
     pub updated_at: i64,
+    /// When the colour, tags or pin last changed on their own; 0 if never.
+    pub meta_updated_at: i64,
     /// Full Markdown (title line + body).
     pub markdown: String,
+}
+
+impl SyncNote {
+    /// What sync compares: the note's newest change of any kind.
+    pub fn version(&self) -> i64 {
+        self.updated_at.max(self.meta_updated_at)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +58,7 @@ pub struct RemoteNote {
     pub tags: Vec<String>,
     pub pinned: bool,
     pub updated_at: i64,
+    pub meta_updated_at: i64,
     /// Full Markdown (title line + body).
     pub markdown: String,
 }
@@ -94,8 +106,9 @@ pub struct CachedFile {
     pub last_modified: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
-    /// The note's `updated_at` parsed from the file, so an unchanged remote
-    /// file can be compared without downloading it again.
+    /// The note's version (see [`SyncNote::version`]) parsed from the file, so
+    /// an unchanged remote file can be compared without downloading it again.
+    /// Named after what it held before notes had a second timestamp.
     #[serde(default)]
     pub updated_at: i64,
 }
@@ -217,6 +230,17 @@ impl DeleteLedger {
         self.deleted
             .retain(|id, _| !remote_gone.contains_key(id) && !revived.contains(id));
     }
+
+    /// Tombstones recorded after `snapshot`, i.e. while a sync pass that took
+    /// that snapshot was running. The pass cannot know about them, so they
+    /// must be put back into the pruned ledger it returns.
+    pub fn added_since(&self, snapshot: &BTreeSet<String>) -> BTreeMap<String, i64> {
+        self.deleted
+            .iter()
+            .filter(|(id, _)| !snapshot.contains(*id))
+            .map(|(id, at)| (id.clone(), *at))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +295,9 @@ pub fn render_markdown_file(note: &SyncNote) -> String {
     out.push_str(&format!("tags: {tags}\n"));
     out.push_str(&format!("pinned: {}\n", note.pinned));
     out.push_str(&format!("updated_at: {}\n", iso8601(note.updated_at)));
+    if note.meta_updated_at > 0 {
+        out.push_str(&format!("meta_updated_at: {}\n", iso8601(note.meta_updated_at)));
+    }
     out.push_str("---\n\n");
     out.push_str(body.trim_end());
     out.push('\n');
@@ -285,6 +312,7 @@ struct Meta {
     tags: Vec<String>,
     pinned: bool,
     updated_at: i64,
+    meta_updated_at: i64,
 }
 
 fn parse_markdown_file(text: &str) -> Option<(Meta, String)> {
@@ -322,6 +350,7 @@ fn parse_markdown_file(text: &str) -> Option<(Meta, String)> {
             }
             "pinned" => meta.pinned = value.eq_ignore_ascii_case("true"),
             "updated_at" => meta.updated_at = parse_iso(value).unwrap_or(0),
+            "meta_updated_at" => meta.meta_updated_at = parse_iso(value).unwrap_or(0),
             _ => {}
         }
     }
@@ -332,6 +361,10 @@ fn parse_markdown_file(text: &str) -> Option<(Meta, String)> {
 }
 
 impl Meta {
+    fn version(&self) -> i64 {
+        self.updated_at.max(self.meta_updated_at)
+    }
+
     fn into_remote(self, body: String) -> RemoteNote {
         let body = body.trim_end();
         let markdown = if body.is_empty() {
@@ -348,6 +381,7 @@ impl Meta {
             tags: self.tags,
             pinned: self.pinned,
             updated_at: self.updated_at,
+            meta_updated_at: self.meta_updated_at,
             markdown,
         }
     }
@@ -474,7 +508,7 @@ fn sync_with_client(
         // `Known` means the cached versions still match, so the file was not
         // touched since the last pass and its body is not needed.
         let remote = match hit {
-            Some(c) => RemoteVersion::Known { updated_at: c.updated_at },
+            Some(c) => RemoteVersion::Known { version: c.updated_at },
             None => match fetch_remote(client, &cfg.dir, &entry.name)? {
                 Some((meta, body)) => RemoteVersion::Fetched { meta, body },
                 None => {
@@ -484,13 +518,13 @@ fn sync_with_client(
                 }
             },
         };
-        let remote_updated = match &remote {
-            RemoteVersion::Known { updated_at } => *updated_at,
-            RemoteVersion::Fetched { meta, .. } => meta.updated_at,
+        let remote_version = match &remote {
+            RemoteVersion::Known { version } => *version,
+            RemoteVersion::Fetched { meta, .. } => meta.version(),
         };
         fresh
             .files
-            .insert(entry.name.clone(), CachedFile::from_entry(entry, remote_updated));
+            .insert(entry.name.clone(), CachedFile::from_entry(entry, remote_version));
 
         let Some(local) = local else {
             // Remote-only file: needs its body before it can be created here.
@@ -499,22 +533,22 @@ fn sync_with_client(
             };
             fresh
                 .files
-                .insert(entry.name.clone(), CachedFile::from_entry(entry, meta.updated_at));
+                .insert(entry.name.clone(), CachedFile::from_entry(entry, meta.version()));
             report.remote_notes.push(meta.into_remote(body));
             report.downloaded += 1;
             continue;
         };
 
-        if remote_updated > local.updated_at {
+        if remote_version > local.version() {
             let Some((meta, body)) = into_body(client, &cfg.dir, &entry.name, remote)? else {
                 continue;
             };
             fresh
                 .files
-                .insert(entry.name.clone(), CachedFile::from_entry(entry, meta.updated_at));
+                .insert(entry.name.clone(), CachedFile::from_entry(entry, meta.version()));
             report.remote_notes.push(meta.into_remote(body));
             report.downloaded += 1;
-        } else if local.updated_at > remote_updated {
+        } else if local.version() > remote_version {
             let new_etag =
                 client.put(&cfg.dir, &entry.name, &render_markdown_file(local))?;
             report.uploaded += 1;
@@ -526,7 +560,7 @@ fn sync_with_client(
                     etag: new_etag,
                     last_modified: None,
                     size: None,
-                    updated_at: local.updated_at,
+                    updated_at: local.version(),
                 },
             );
         } else {
@@ -547,11 +581,11 @@ fn sync_with_client(
         }
         match cache.files.get(&file) {
             // We knew this file; it vanished from the server. If this device
-            // has not touched the note since (local time == the version we
+            // has not touched the note since (local version == the version we
             // last saw), the deletion was made on another device and wins
-            // here too. A newer local edit means this device was working
-            // offline: upload ours, the timestamps decide on other devices.
-            Some(c) if note.updated_at <= c.updated_at => {
+            // here too. A newer local change means this device was working
+            // offline: upload ours, the versions decide on other devices.
+            Some(c) if note.version() <= c.updated_at => {
                 report.deleted_local.push(id.to_string());
             }
             _ => {
@@ -563,7 +597,7 @@ fn sync_with_client(
                         etag: new_etag,
                         last_modified: None,
                         size: None,
-                        updated_at: note.updated_at,
+                        updated_at: note.version(),
                     },
                 );
             }
@@ -575,7 +609,7 @@ fn sync_with_client(
 
 enum RemoteVersion {
     /// Version markers matched the cache; body not downloaded.
-    Known { updated_at: i64 },
+    Known { version: i64 },
     Fetched { meta: Meta, body: String },
 }
 
@@ -934,8 +968,115 @@ mod tests {
             tags: vec!["工作".into(), "dav".into()],
             pinned: true,
             updated_at: 639_000_000_000_000_000,
+            meta_updated_at: 0,
             markdown: "# 测试标题\n\n正文 **加粗** 内容\n```\ncode\n```".into(),
         }
+    }
+
+    /// A PROPFIND reply listing the collection and one file.
+    fn propfind_with(name: &str, etag: &str) -> &'static str {
+        let xml = format!(
+            r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+  <d:response><d:href>/dav/StickyNotes/</d:href></d:response>
+  <d:response><d:href>/dav/StickyNotes/{name}</d:href><d:propstat><d:prop>
+    <d:getetag>"{etag}"</d:getetag><d:getcontentlength>100</d:getcontentlength>
+  </d:prop></d:propstat></d:response>
+</d:multistatus>"#
+        );
+        Box::leak(xml.into_boxed_str())
+    }
+
+    #[test]
+    fn the_meta_time_is_written_only_once_there_is_one_and_round_trips() {
+        let plain = render_markdown_file(&note());
+        assert!(!plain.contains("meta_updated_at"), "{plain}");
+        let (meta, _) = parse_markdown_file(&plain).unwrap();
+        assert_eq!((meta.meta_updated_at, meta.version()), (0, note().updated_at));
+
+        // Sub-second precision matters: versions are compared exactly.
+        let touched = SyncNote { meta_updated_at: note().updated_at + 1_234_567, ..note() };
+        let rendered = render_markdown_file(&touched);
+        assert!(rendered.contains("\nmeta_updated_at: "), "{rendered}");
+        let (meta, body) = parse_markdown_file(&rendered).unwrap();
+        assert_eq!(meta.updated_at, touched.updated_at);
+        assert_eq!(meta.meta_updated_at, touched.meta_updated_at);
+        assert_eq!(meta.version(), touched.version());
+        assert_eq!(meta.into_remote(body).meta_updated_at, touched.meta_updated_at);
+    }
+
+    #[test]
+    fn a_colour_change_alone_is_uploaded() {
+        let local = SyncNote { meta_updated_at: note().updated_at + 50, ..note() };
+        let name = format!("{}.md", local.id);
+        let (cfg, client, server) = run_mock_dav(vec![
+            ("207 Multi-Status", "application/xml", propfind_with(&name, "1")),
+            ("201 Created", "text/plain", ""),
+        ]);
+        // The server still has what this device uploaded before the change.
+        let mut cache = SyncCache::default();
+        let before = CachedFile {
+            etag: Some("\"1\"".into()),
+            updated_at: local.updated_at,
+            ..Default::default()
+        };
+        cache.files.insert(name.clone(), before);
+
+        let outcome = sync_with_client(
+            &client,
+            &cfg,
+            std::slice::from_ref(&local),
+            &cache,
+            false,
+            &mut DeleteLedger::default(),
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[1].starts_with(&format!("PUT /dav/StickyNotes/{name}")), "{requests:?}");
+        assert_eq!(outcome.report.uploaded, 1);
+        assert_eq!(outcome.cache.files[&name].updated_at, local.version());
+    }
+
+    #[test]
+    fn a_colour_change_on_another_device_is_downloaded() {
+        let local = note();
+        let theirs = SyncNote {
+            color: "Purple".into(),
+            pinned: false,
+            meta_updated_at: local.updated_at + 50,
+            ..note()
+        };
+        let name = format!("{}.md", local.id);
+        let file: &'static str = Box::leak(render_markdown_file(&theirs).into_boxed_str());
+        let (cfg, client, server) = run_mock_dav(vec![
+            ("207 Multi-Status", "application/xml", propfind_with(&name, "2")),
+            ("200 OK", "text/markdown", file),
+        ]);
+        let mut cache = SyncCache::default();
+        let before = CachedFile {
+            etag: Some("\"1\"".into()),
+            updated_at: local.updated_at,
+            ..Default::default()
+        };
+        cache.files.insert(name.clone(), before);
+
+        let outcome = sync_with_client(
+            &client,
+            &cfg,
+            std::slice::from_ref(&local),
+            &cache,
+            false,
+            &mut DeleteLedger::default(),
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[1].starts_with(&format!("GET /dav/StickyNotes/{name}")), "{requests:?}");
+        assert_eq!((outcome.report.downloaded, outcome.report.uploaded), (1, 0));
+        let remote = &outcome.report.remote_notes[0];
+        assert_eq!(remote.color, "Purple");
+        assert!(!remote.pinned);
+        assert_eq!((remote.updated_at, remote.meta_updated_at), (theirs.updated_at, theirs.meta_updated_at));
+        assert_eq!(outcome.cache.files[&name].updated_at, theirs.version());
     }
 
     #[test]
@@ -1088,6 +1229,29 @@ mod tests {
             ..Default::default()
         };
         assert!(!ledger.matches(&other));
+    }
+
+    #[test]
+    fn ledger_reports_tombstones_added_after_a_pass_snapshot() {
+        let cfg = WebDavConfig {
+            url: "https://example.com/dav".into(),
+            dir: "/StickyNotes".into(),
+            ..Default::default()
+        };
+        let mut ledger = DeleteLedger::default();
+        ledger.record(&cfg, "11111111-1111-1111-1111-111111111111", 100);
+        let snapshot: BTreeSet<String> = ledger.deleted.keys().cloned().collect();
+        // A note deleted while the pass ran.
+        ledger.record(&cfg, "22222222-2222-2222-2222-222222222222", 200);
+
+        let added = ledger.added_since(&snapshot);
+        assert_eq!(added.len(), 1);
+        assert_eq!(
+            added["22222222-2222-2222-2222-222222222222"],
+            200,
+            "only the intent the pass never saw is returned"
+        );
+        assert!(ledger.added_since(&ledger.deleted.keys().cloned().collect()).is_empty());
     }
 
     #[test]

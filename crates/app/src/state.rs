@@ -1,20 +1,32 @@
+use crate::quick_note::QuickNote;
+use crate::win;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 use markdown_editor::{BlockEditorEvent, BlockEditorState};
 use stickynotes_core::{
-    config::{self, AppConfig},
+    config::{self, AppConfig, SyncDelayError},
+    shortcuts,
     store::{
         self, backup, import, legacy,
         model::{NoteSummary, RemoteUpdate, Tag},
         NoteStore,
     },
-    webdav,
+    ticks, webdav,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+mod keys;
+mod quick;
+mod shell;
+
+pub(crate) use keys::md_command;
+
+/// Where the source code lives; shown on the settings dialog's About page.
+pub const REPOSITORY_URL: &str = "https://github.com/RichardQt/stickynotes";
 
 /// Visual spec for note papers with refined paper aesthetics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,60 +41,60 @@ pub struct ThemeSpec {
 
 pub const THEMES: &[ThemeSpec] = &[
     ThemeSpec {
+        name: "White",
+        label: "纯白",
+        accent: 0xFFFFFF,
+        paper_bg: 0xFFFFFF,
+        card_active_bg: 0xEEF4FC,
+        border: 0xBDD2EC,
+    },
+    ThemeSpec {
         name: "Yellow",
         label: "暖阳黄",
-        accent: 0xE8B955,
-        paper_bg: 0xFFFDF4,
-        card_active_bg: 0xFBF3D0,
-        border: 0xF0E4B8,
+        accent: 0xEAB548,
+        paper_bg: 0xFFFCF0,
+        card_active_bg: 0xFDF3CE,
+        border: 0xEEDB9B,
     },
     ThemeSpec {
         name: "Green",
         label: "薄荷绿",
-        accent: 0x6FB594,
-        paper_bg: 0xF3FBF5,
-        card_active_bg: 0xDFF2E4,
-        border: 0xC4E6CC,
-    },
-    ThemeSpec {
-        name: "Pink",
-        label: "蔷薇粉",
-        accent: 0xD994A9,
-        paper_bg: 0xFDF5F8,
-        card_active_bg: 0xF7E1E9,
-        border: 0xEFD0DB,
-    },
-    ThemeSpec {
-        name: "Purple",
-        label: "薰衣紫",
-        accent: 0xA693D6,
-        paper_bg: 0xF9F6FD,
-        card_active_bg: 0xEBE2F6,
-        border: 0xDCCFF0,
+        accent: 0x5DB589,
+        paper_bg: 0xF4FCF7,
+        card_active_bg: 0xE0F4E7,
+        border: 0xBEE5CC,
     },
     ThemeSpec {
         name: "Blue",
         label: "天空蓝",
-        accent: 0x7FABC8,
-        paper_bg: 0xF2F8FC,
-        card_active_bg: 0xDFECF4,
-        border: 0xC6DDEA,
+        accent: 0x67A2D6,
+        paper_bg: 0xF4F9FE,
+        card_active_bg: 0xE1EFFB,
+        border: 0xBED8F0,
+    },
+    ThemeSpec {
+        name: "Pink",
+        label: "蔷薇粉",
+        accent: 0xDF8AA5,
+        paper_bg: 0xFEF6F9,
+        card_active_bg: 0xF9E3EB,
+        border: 0xF0CAD8,
+    },
+    ThemeSpec {
+        name: "Purple",
+        label: "薰衣紫",
+        accent: 0x9E88D8,
+        paper_bg: 0xF9F6FE,
+        card_active_bg: 0xEDE4F9,
+        border: 0xD9CBF2,
     },
     ThemeSpec {
         name: "Gray",
-        label: "晨雾灰",
-        accent: 0x9AA5B1,
-        paper_bg: 0xF9FAFB,
-        card_active_bg: 0xE5E9F0,
-        border: 0xCBD3DF,
-    },
-    ThemeSpec {
-        name: "White",
-        label: "纯白",
-        accent: 0xB4BCC8,
-        paper_bg: 0xFFFFFF,
-        card_active_bg: 0xEAF0FA,
-        border: 0xC6D6EC,
+        label: "云雾灰",
+        accent: 0x909CAA,
+        paper_bg: 0xF7F9FB,
+        card_active_bg: 0xEAEFF5,
+        border: 0xCFD8E4,
     },
 ];
 
@@ -109,6 +121,35 @@ pub enum SyncStatus {
     Busy(String),
 }
 
+/// What a WebDAV pass is for, which decides whether it shows itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPass {
+    /// The periodic or "back from another app" freshness check: no
+    /// "正在同步…" and no status line unless it changed something or failed.
+    Quiet,
+    /// Started by an edit or a settings change: shows its state.
+    Visible,
+    /// The "立即同步" button: shows its state and ignores the version cache.
+    Forced,
+}
+
+impl SyncPass {
+    fn quiet(self) -> bool {
+        self == Self::Quiet
+    }
+
+    fn force(self) -> bool {
+        self == Self::Forced
+    }
+}
+
+/// Which drop-down list of the settings dialog is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsMenu {
+    CloseBehavior,
+    PullInterval,
+}
+
 /// Result of the settings dialog's "test connection" probe.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WebDavTest {
@@ -131,6 +172,49 @@ pub struct SettingsInputs {
     pub user: Entity<InputState>,
     pub pass: Entity<InputState>,
     pub dir: Entity<InputState>,
+    /// Seconds between the last edit and the automatic upload.
+    pub delay: Entity<InputState>,
+}
+
+/// The pages of the settings dialog, in the order of its left column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPage {
+    General,
+    Shortcuts,
+    About,
+}
+
+impl SettingsPage {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::General => 0,
+            Self::Shortcuts => 1,
+            Self::About => 2,
+        }
+    }
+}
+
+/// The quick-note view and, when it has a window of its own, that window.
+pub(crate) struct QuickHost {
+    pub(crate) view: Entity<QuickNote>,
+    /// The window and its native handle. `None` when no separate window
+    /// could be opened: the view is then shown as a card in the main window.
+    pub(crate) window: Option<(AnyWindowHandle, isize)>,
+}
+
+/// One quick note being written: it starts with the first character typed
+/// and ends when the quick-note window is put away.
+#[derive(Default)]
+pub(crate) struct QuickSession {
+    /// The note this session created. `None` until something was typed:
+    /// opening the window and closing it again leaves no empty note behind.
+    note_id: Option<String>,
+    /// Text last written to that note.
+    saved: String,
+    /// Bumped on every edit so only the last debounced save runs.
+    epoch: u64,
+    /// The last write hit a locked database; the background loop retries it.
+    retry: bool,
 }
 
 fn short_id(id: &str) -> &str {
@@ -197,8 +281,9 @@ pub struct MdTip {
     /// Which button owns this hint, so leaving another button cannot clear it.
     pub id: &'static str,
     pub label: &'static str,
-    /// Keyboard shortcut, empty when the editor binds none.
-    pub keys: &'static str,
+    /// The shortcut action behind the button; the hint shows whatever keys
+    /// are bound to it at the moment.
+    pub action: &'static str,
     /// Button's left edge and bottom edge in window coordinates.
     pub x: Pixels,
     pub y: Pixels,
@@ -278,6 +363,16 @@ pub struct AppState {
     /// A sync was requested while one was running; run once more afterwards
     /// instead of dropping the request.
     webdav_pending: bool,
+    /// The pass in flight is a background pull (see [`SyncPass`]).
+    pub webdav_quiet: bool,
+    /// A visible or forced pass was asked for while a quiet one ran: run it
+    /// right after, without the usual upload delay.
+    webdav_pending_force: bool,
+    /// When the last pass started. Returning to the window pulls at most
+    /// once per half minute, however much the user alt-tabs.
+    webdav_last_pass: Option<Instant>,
+    /// The last pass failed; the sidebar dot stays red until one succeeds.
+    pub webdav_failed: bool,
 
     // UI state toggles
     pub show_sidebar_add_tag: bool,
@@ -306,6 +401,59 @@ pub struct AppState {
     /// Latest painted bounds of each toolbar button, keyed by element id.
     /// Written from prepaint (no notify) and read when a hover starts.
     pub md_tip_bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+
+    // Settings dialog
+    pub settings_page: SettingsPage,
+    /// `+1.0` when navigating down the settings rail, `-1.0` when navigating up.
+    pub settings_page_dir: f32,
+    /// Monotonically bumped only when the user switches tabs inside Settings,
+    /// so opening Settings directly onto an existing tab never double-animates
+    /// the inner page alongside the modal's own entrance.
+    pub settings_page_seq: usize,
+    /// Scroll position of the page shown, shared by the three pages.
+    pub settings_scroll: ScrollHandle,
+    /// Why the typed sync delay was refused. The stored delay stays as it
+    /// was while this is set.
+    pub delay_error: Option<SyncDelayError>,
+    /// Bumped whenever the delay field changes, so that only the last value
+    /// typed can turn into an error message.
+    delay_epoch: u64,
+    /// The drop-down list of the settings dialog that is open, if any.
+    pub settings_menu: Option<SettingsMenu>,
+    /// The "clear all notes" confirmation is open, since this instant.
+    pub confirm_clear: Option<Instant>,
+    /// How many notes the confirmation is about. Kept apart from the list,
+    /// so the question still reads right while it fades out over an
+    /// already empty list.
+    pub confirm_clear_count: usize,
+    /// Outcome of the last "clear all notes".
+    pub danger_note: Option<StorageNote>,
+    /// Holds the focus while a dialog is open, so key presses reach neither
+    /// the note behind it nor a field of a page that is not shown.
+    pub modal_focus: FocusHandle,
+    /// The repository address was copied a moment ago (About page).
+    pub about_copied: bool,
+    about_copied_epoch: u64,
+
+    // Keyboard shortcuts
+    /// The shortcuts in effect: the defaults plus the changes in `config`.
+    pub keymap: shortcuts::Keymap,
+    /// The action whose shortcut is being recorded on the settings page.
+    pub recording_shortcut: Option<&'static str>,
+    /// Why the last recorded combination was refused, and for which action.
+    pub shortcut_error: Option<(&'static str, String)>,
+
+    // Notification area and quick note
+    /// `None` when there is no notification-area icon to come back from:
+    /// closing the main window then always quits.
+    tray: Option<win::Tray>,
+    /// Native handle of the main window, for hiding and showing it.
+    main_hwnd: Option<isize>,
+    pub(crate) quick: Option<QuickHost>,
+    /// The quick note is shown as a card in the main window — the fallback
+    /// when it has no window of its own.
+    pub quick_overlay_open: bool,
+    quick_session: QuickSession,
 }
 
 impl AppState {
@@ -345,6 +493,7 @@ impl AppState {
         .detach();
 
         let window_handle = window.window_handle();
+        let keymap = shortcuts::Keymap::resolve(&config.shortcuts);
         let mut app = Self {
             store,
             startup_error,
@@ -381,6 +530,10 @@ impl AppState {
             webdav_failures: 0,
             webdav_next_try: Instant::now(),
             webdav_pending: false,
+            webdav_quiet: false,
+            webdav_pending_force: false,
+            webdav_last_pass: None,
+            webdav_failed: false,
             show_sidebar_add_tag: false,
             new_tag_input: Some(new_tag_input),
             search_input: Some(search_input),
@@ -391,8 +544,30 @@ impl AppState {
             md_tip_closed_at: None,
             md_tip_hover: None,
             md_tip_bounds: Rc::new(RefCell::new(HashMap::new())),
+            settings_page: SettingsPage::General,
+            settings_page_dir: 1.0,
+            settings_page_seq: 0,
+            settings_scroll: ScrollHandle::new(),
+            delay_error: None,
+            delay_epoch: 0,
+            settings_menu: None,
+            confirm_clear: None,
+            confirm_clear_count: 0,
+            danger_note: None,
+            modal_focus: cx.focus_handle(),
+            about_copied: false,
+            about_copied_epoch: 0,
+            keymap,
+            recording_shortcut: None,
+            shortcut_error: None,
+            tray: None,
+            main_hwnd: win::hwnd_of(window),
+            quick: None,
+            quick_overlay_open: false,
+            quick_session: QuickSession::default(),
         };
 
+        app.start_shell(window, cx);
         if app.startup_error.is_none() {
             app.start_session(window, cx);
         }
@@ -408,7 +583,7 @@ impl AppState {
         // Pull WebDAV changes right away; silent when the server is not
         // configured yet.
         if self.config.webdav_auto && self.config.webdav_configured() {
-            self.start_webdav_sync(window, cx, false);
+            self.start_webdav_sync(window, cx, SyncPass::Quiet);
         }
     }
 
@@ -579,6 +754,10 @@ impl AppState {
         if self.selected_id.as_deref() == Some(id) && self.editor.is_some() {
             return;
         }
+        // The quick note hands its note over before the main panel opens it.
+        if self.quick_note_id() == Some(id) && !self.quick_release_note(window, cx) {
+            return;
+        }
         // The debounced autosave may still be pending for the note we are
         // leaving. Flush it before its editor is replaced — otherwise the
         // timer fires against the *new* editor and the edit is silently lost.
@@ -644,8 +823,15 @@ impl AppState {
     }
 
     pub fn select_note_by_index(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Picking a note automatically never takes the one the quick note is
+        // still writing: that would end its session behind the user's back.
+        let quick = self.quick_note_id().map(str::to_string);
         let notes = self.filtered_notes();
-        if let Some(note) = notes.get(idx) {
+        let pick = notes
+            .iter()
+            .filter(|note| Some(&note.id) != quick.as_ref())
+            .nth(idx);
+        if let Some(note) = pick {
             let id = note.id.clone();
             self.select_note(&id, window, cx);
         }
@@ -717,7 +903,7 @@ impl AppState {
         let dirty = self.last_saved_md.as_deref() != Some(self.compose_md(cx).as_str());
         debug_log(&format!("flush dirty={dirty}"));
         if dirty {
-            self.save_current(cx);
+            let _ = self.save_current(cx);
         }
         // Invalidate any debounce timer captured against the old editor.
         self.save_epoch = self.save_epoch.wrapping_add(1);
@@ -739,8 +925,12 @@ impl AppState {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 if this.save_epoch == epoch {
-                    this.save_current(cx);
-                    this.schedule_webdav_sync(window, cx);
+                    // Only a save that actually changed the stored text is
+                    // worth an upload: a no-op write would bump `updated_at`,
+                    // and that alone starts a WebDAV pass a few seconds later.
+                    if this.save_current(cx) {
+                        this.schedule_webdav_sync(window, cx);
+                    }
                 }
             })
             .ok();
@@ -748,14 +938,21 @@ impl AppState {
         .detach();
     }
 
-    pub fn save_current(&mut self, cx: &mut Context<Self>) {
+    /// Write the open note to the database. Returns whether anything was
+    /// written: an unchanged text is not touched, so its `updated_at` (the
+    /// timestamp sync compares) does not move and no upload follows.
+    pub fn save_current(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(id) = self.selected_id.clone() else {
-            return;
+            return false;
         };
         if self.editor.is_none() {
-            return;
+            return false;
         }
         let md = self.compose_md(cx);
+        if self.last_saved_md.as_deref() == Some(md.as_str()) {
+            debug_log(&format!("save skipped (unchanged) id={}", short_id(&id)));
+            return false;
+        }
         debug_log(&format!("save id={} len={}", short_id(&id), md.len()));
         match self.store.save_markdown(&id, &md) {
             Ok(updated_at) => {
@@ -779,6 +976,7 @@ impl AppState {
                     SyncStatus::Error(format!("保存失败：{e}"))
                 };
                 debug_log(&format!("save err retryable={retryable} msg={e}"));
+                return false;
             }
         }
 
@@ -790,10 +988,11 @@ impl AppState {
         }
         self.update_stats_from_editor(cx);
         cx.notify();
+        true
     }
 
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.store.create_note("", "Yellow") {
+        match self.store.create_note("", "White") {
             Ok(new_id) => {
                 if let Ok(notes) = self.store.list_notes() {
                     self.notes = notes;
@@ -826,6 +1025,11 @@ impl AppState {
             self.pending_save = None;
             self.clear_selection();
         }
+        // The same goes for the quick note, should it be writing this note:
+        // left open, its next key press would bring the note back.
+        if self.quick_note_id() == Some(id) {
+            self.quick_close(cx);
+        }
         match self.store.soft_delete(id) {
             Ok(()) => {
                 // Remember the deletion so the remote `.md` goes away too;
@@ -835,6 +1039,10 @@ impl AppState {
                 if self.config.webdav_configured() {
                     self.webdav_deletions
                         .record(&self.config.webdav, id, stickynotes_core::ticks::now_ticks());
+                    // Persist the intent now: if the app closes before the
+                    // debounced pass runs, the remote `.md` would otherwise
+                    // come back as a remote-only note on the next launch.
+                    let _ = self.webdav_deletions.save();
                 }
                 self.status = SyncStatus::Saved("便签已删除".into());
                 self.reload(window, cx);
@@ -850,15 +1058,36 @@ impl AppState {
     pub fn set_theme(&mut self, theme: &str, cx: &mut Context<Self>) {
         let Some(id) = self.selected_id.clone() else { return };
         match self.store.set_theme(&id, theme) {
-            Ok(()) => {
-                self.status = SyncStatus::Saved(format!("颜色已设为 {theme}"));
-                if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
-                    note.theme = theme.to_string();
+            Ok(changed) => {
+                if changed {
+                    self.status = SyncStatus::Saved(format!("颜色已设为 {theme}"));
+                    if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
+                        note.theme = theme.to_string();
+                    }
+                    self.metadata_changed(cx);
                 }
             }
             Err(e) => self.status = SyncStatus::Error(format!("{e}")),
         }
         cx.notify();
+    }
+
+    /// A note's colour, tags or pin changed on its own. Unlike a text edit it
+    /// has its own upload: the debounced save only runs when the text did,
+    /// so without this the change would wait for the next text edit — and be
+    /// overwritten by an older copy from another device in the meantime.
+    ///
+    /// A pass is only scheduled after the usual upload delay. The window is
+    /// reached through its handle because context-menu callbacks only get
+    /// the app, not a window.
+    fn metadata_changed(&mut self, cx: &mut Context<Self>) {
+        let handle = self.window_handle;
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| this.schedule_webdav_sync(window, cx));
+            });
+        });
     }
 
     pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -914,6 +1143,19 @@ impl AppState {
         cx.notify();
     }
 
+    /// The "new tag" shortcut: show the sidebar's field and put the caret in
+    /// it. Unlike the button it never hides a field that is already there.
+    pub fn begin_new_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_sidebar_add_tag {
+            if let Some(input) = &self.new_tag_input {
+                let handle = input.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+        } else {
+            self.toggle_sidebar_add_tag(window, cx);
+        }
+    }
+
     pub fn add_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(input) = self.new_tag_input.clone() else { return };
         let name = input.read(cx).value().to_string();
@@ -924,7 +1166,9 @@ impl AppState {
         match self.store.create_tag(&name) {
             Ok(tid) => {
                 if let Some(id) = &self.selected_id {
-                    let _ = self.store.tag_note(id, tid);
+                    if self.store.tag_note(id, tid).unwrap_or(false) {
+                        self.metadata_changed(cx);
+                    }
                 }
                 input.update(cx, |s, cx| s.set_value("", window, cx));
                 self.status = SyncStatus::Saved(format!("标签 #{name} 已添加"));
@@ -940,11 +1184,15 @@ impl AppState {
 
     pub fn delete_tag(&mut self, id: i64, cx: &mut Context<Self>) {
         match self.store.delete_tag(id) {
-            Ok(()) => {
+            Ok(affected) => {
                 if self.tag_filter == Some(id) {
                     self.tag_filter = None;
                 }
                 self.status = SyncStatus::Saved("标签已删除".into());
+                // Every note that had the tag changed with it.
+                if affected > 0 {
+                    self.metadata_changed(cx);
+                }
             }
             Err(e) => self.status = SyncStatus::Error(format!("{e}")),
         }
@@ -966,10 +1214,14 @@ impl AppState {
         } else {
             self.store.tag_note(note_id, tag_id)
         };
-        if let Err(e) = result {
-            self.status = SyncStatus::Error(format!("{e}"));
-        } else {
-            self.reload_tags_cache();
+        match result {
+            Err(e) => self.status = SyncStatus::Error(format!("{e}")),
+            Ok(changed) => {
+                self.reload_tags_cache();
+                if changed {
+                    self.metadata_changed(cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -979,7 +1231,7 @@ impl AppState {
     pub fn toggle_pin(&mut self, note_id: &str, cx: &mut Context<Self>) {
         let pin = !self.pinned.contains(note_id);
         match self.store.set_pinned(note_id, pin) {
-            Ok(()) => {
+            Ok(changed) => {
                 if pin {
                     self.pinned.insert(note_id.to_string());
                 } else {
@@ -987,6 +1239,9 @@ impl AppState {
                 }
                 self.status =
                     SyncStatus::Saved(if pin { "已置顶" } else { "已取消置顶" }.into());
+                if changed {
+                    self.metadata_changed(cx);
+                }
             }
             Err(e) => self.status = SyncStatus::Error(format!("{e}")),
         }
@@ -1021,6 +1276,7 @@ impl AppState {
             return;
         }
         self.retry_pending_save(cx);
+        self.retry_quick_save(window, cx);
 
         if Instant::now() >= self.next_backup_check {
             self.next_backup_check = Instant::now() + Duration::from_secs(30 * 60);
@@ -1032,16 +1288,41 @@ impl AppState {
         }
 
         // Background WebDAV pull. With the version cache a quiet pass is a
-        // single PROPFIND per minute; when the server is failing, the interval
-        // backs off so it is not hammered. Local edits still upload via the
-        // 2.5s debounce instead of waiting for this.
+        // single PROPFIND every few minutes; when the server is failing, the
+        // interval backs off so it is not hammered. Local edits still upload
+        // via the debounce (`sync_delay`) instead of waiting for this.
         if self.config.webdav_auto
             && self.config.webdav_configured()
             && !self.webdav_syncing
             && Instant::now() >= self.webdav_next_try
         {
-            self.start_webdav_sync(window, cx, false);
+            self.start_webdav_sync(window, cx, SyncPass::Quiet);
         }
+    }
+
+    /// Back in the main window: check the server right away, at most once
+    /// every 30 seconds, so alt-tabbing does not become a sync storm.
+    pub fn pull_on_return(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.startup_error.is_some()
+            || !self.config.webdav_auto
+            || !self.config.webdav_configured()
+            || self.webdav_syncing
+        {
+            return;
+        }
+        // While the server is failing, only the background backoff decides
+        // when to try again (the red dot says why): returning to the window
+        // must not add attempts on top of it.
+        if self.webdav_failed && Instant::now() < self.webdav_next_try {
+            return;
+        }
+        if self
+            .webdav_last_pass
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(30))
+        {
+            return;
+        }
+        self.start_webdav_sync(window, cx, SyncPass::Quiet);
     }
 
     /// Retry the exact text that failed, even if the selection has moved on
@@ -1082,10 +1363,50 @@ impl AppState {
         self.show_settings = true;
         self.webdav_test = WebDavTest::Idle;
         self.pending_adopt = None;
+        self.settings_menu = None;
+        self.recording_shortcut = None;
+        self.shortcut_error = None;
+        self.confirm_clear = None;
+        self.danger_note = None;
+        self.about_copied = false;
+        // The delay field shows the delay in effect, not a refused leftover
+        // from the last visit.
+        self.delay_error = None;
+        self.delay_epoch = self.delay_epoch.wrapping_add(1);
+        self.settings_scroll.set_offset(point(px(0.), px(0.)));
         if let Some(s) = &self.settings {
-            let handle = s.url.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
+            let shown = config::format_sync_delay_secs(self.config.sync_delay_ms);
+            s.delay.update(cx, |s, cx| s.set_value(shown, window, cx));
         }
+        // The dialog itself takes the focus — not one of its fields, where a
+        // stray key press would edit a setting, and not the note behind it.
+        window.focus(&self.modal_focus, cx);
+        cx.notify();
+    }
+
+    /// Switch the settings dialog to another page of its left column.
+    pub fn set_settings_page(
+        &mut self,
+        page: SettingsPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_page != page {
+            self.settings_page_dir = if page.index() >= self.settings_page.index() {
+                1.0
+            } else {
+                -1.0
+            };
+            self.settings_page_seq = self.settings_page_seq.wrapping_add(1);
+            // Every page starts at its top.
+            self.settings_scroll.set_offset(point(px(0.), px(0.)));
+        }
+        self.settings_page = page;
+        self.settings_menu = None;
+        self.recording_shortcut = None;
+        self.shortcut_error = None;
+        // A field of the page that was left must not keep the caret.
+        window.focus(&self.modal_focus, cx);
         cx.notify();
     }
 
@@ -1093,6 +1414,19 @@ impl AppState {
         if self.settings.is_some() {
             return;
         }
+        let shown_delay = config::format_sync_delay_secs(self.config.sync_delay_ms);
+        let delay = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("2.5");
+            s.set_value(shown_delay, window, cx);
+            s
+        });
+        cx.subscribe_in(&delay, window, |this, input, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                let text = input.read(cx).value().to_string();
+                this.on_sync_delay_typed(&text, window, cx);
+            }
+        })
+        .detach();
         let w = self.config.webdav.clone();
         let url = cx.new(|cx| {
             let mut s = InputState::new(window, cx).placeholder("https://example.com/dav/");
@@ -1116,11 +1450,50 @@ impl AppState {
             s.set_value(dir, window, cx);
             s
         });
-        self.settings = Some(SettingsInputs { url, user, pass, dir });
+        self.settings = Some(SettingsInputs { url, user, pass, dir, delay });
     }
 
-    /// Copy the form back into the config and persist it.
-    fn persist_settings(&mut self, cx: &App) {
+    /// The sync-delay field changed. A valid delay takes effect and is saved
+    /// at once; anything else leaves the previous delay in place.
+    fn on_sync_delay_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.delay_epoch = self.delay_epoch.wrapping_add(1);
+        match config::parse_sync_delay_secs(text) {
+            Ok(ms) => {
+                self.delay_error = None;
+                if self.config.sync_delay_ms != ms {
+                    self.config.sync_delay_ms = ms;
+                    if let Err(e) = self.config.save() {
+                        self.status = SyncStatus::Error(format!("保存设置失败：{e}"));
+                    }
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                // A number on its way ("0." before "0.5") is not worth a red
+                // line: say what is wrong only once the typing pauses.
+                let epoch = self.delay_epoch;
+                let this = cx.weak_entity();
+                window
+                    .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(600))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.delay_epoch == epoch {
+                                this.delay_error = Some(error);
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+            }
+        }
+    }
+
+    /// Copy the form back into the config and persist it. Returns whether the
+    /// WebDAV target (server, credentials, collection) actually changed — the
+    /// only case that is worth a sync of its own.
+    fn persist_settings(&mut self, cx: &App) -> bool {
         let before = self.config.webdav.clone();
         if let Some(s) = &self.settings {
             self.config.webdav.url = s.url.read(cx).value().trim().to_string();
@@ -1144,20 +1517,26 @@ impl AppState {
             self.webdav_deletions = webdav::DeleteLedger::default();
             self.webdav_dir_ready = false;
             self.webdav_failures = 0;
+            self.webdav_failed = false;
             self.webdav_next_try = Instant::now();
         }
         if let Err(e) = self.config.save() {
             self.status = SyncStatus::Error(format!("保存设置失败：{e}"));
         }
+        target_changed
     }
 
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.show_settings {
             return;
         }
-        self.persist_settings(cx);
+        let target_changed = self.persist_settings(cx);
         self.show_settings = false;
         self.pending_adopt = None;
+        self.settings_menu = None;
+        self.recording_shortcut = None;
+        self.shortcut_error = None;
+        self.confirm_clear = None;
         // Return focus from the unmounting modal fields back to the open note.
         if let Some(editor) = &self.editor {
             let handle = editor.read(cx).focus_handle(cx);
@@ -1165,8 +1544,11 @@ impl AppState {
         } else {
             window.blur(cx);
         }
-        // A fresh configuration is worth an immediate (debounced) sync.
-        self.schedule_webdav_sync(window, cx);
+        // Only a changed server/collection is worth a pass: merely opening and
+        // closing the dialog must not start a sync of its own.
+        if target_changed {
+            self.schedule_webdav_sync(window, cx);
+        }
         cx.notify();
     }
 
@@ -1176,8 +1558,140 @@ impl AppState {
         if on {
             // Try soon instead of waiting out a backoff from while it was off.
             self.webdav_failures = 0;
+            self.webdav_failed = false;
             self.webdav_next_try = Instant::now();
         }
+        cx.notify();
+    }
+
+    // --- Settings: clear all notes ---
+
+    /// The red "清除全部便签" button: ask first.
+    pub fn request_clear_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notes.is_empty() {
+            return;
+        }
+        self.settings_menu = None;
+        self.recording_shortcut = None;
+        self.confirm_clear = Some(Instant::now());
+        self.confirm_clear_count = self.notes.len();
+        window.focus(&self.modal_focus, cx);
+        cx.notify();
+    }
+
+    pub fn cancel_clear_all(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm_clear.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The red button of the confirmation.
+    pub fn confirm_clear_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(asked) = self.confirm_clear else {
+            return;
+        };
+        // The second click of a double click on "清除全部便签" must not
+        // count as the answer to a question that has only just appeared.
+        if asked.elapsed() < Duration::from_millis(450) {
+            return;
+        }
+        self.confirm_clear = None;
+        self.clear_all_notes(window, cx);
+    }
+
+    /// Delete every note. The tags stay; a snapshot of the database is taken
+    /// first, and with WebDAV configured the notes go from the server (and so
+    /// from the other devices) too.
+    fn clear_all_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.notify();
+        // However this ends, the outcome is written under the red button at
+        // the very end of the page: keep that in view.
+        self.settings_scroll.scroll_to_bottom();
+        // Whatever is still being typed goes into the database first: the
+        // snapshot below is the way back and has to hold every note.
+        self.flush_pending_save(cx);
+        self.retry_pending_save(cx);
+        if !self.quick_flush(window, cx) || self.pending_save.is_some() {
+            self.danger_note = Some(StorageNote::Error(
+                "当前便签还没有保存成功（数据库被占用），请稍后再试".into(),
+            ));
+            return;
+        }
+        let snapshot = match backup::snapshot(&self.store, &backup::default_dir()) {
+            Ok(path) => path,
+            Err(e) => {
+                self.danger_note = Some(StorageNote::Error(format!(
+                    "备份失败，没有清除任何便签：{e}"
+                )));
+                return;
+            }
+        };
+        let ids = match self.store.soft_delete_all() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.danger_note = Some(StorageNote::Error(format!(
+                    "清除失败，便签没有变化：{e}"
+                )));
+                return;
+            }
+        };
+        // As with a single delete: without the ledger the next sync pass
+        // would find the files on the server and bring every note back.
+        if self.config.webdav_configured() {
+            let now = ticks::now_ticks();
+            for id in &ids {
+                self.webdav_deletions.record(&self.config.webdav, id, now);
+            }
+            let _ = self.webdav_deletions.save();
+        }
+
+        // No note is open any more, here or in the quick note; a save still
+        // waiting for its pause must not write into a deleted note.
+        self.save_epoch = self.save_epoch.wrapping_add(1);
+        self.pending_save = None;
+        self.clear_selection();
+        self.quick_close(cx);
+        self.reload(window, cx);
+
+        let file = snapshot
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.danger_note = Some(StorageNote::Info(format!(
+            "已清除 {} 条便签。清除前的备份：{file}",
+            ids.len()
+        )));
+        self.status = SyncStatus::Saved(format!("已清除 {} 条便签", ids.len()));
+        debug_log(&format!("cleared notes={}", ids.len()));
+        self.schedule_webdav_sync(window, cx);
+    }
+
+    // --- Settings: about ---
+
+    pub fn open_repository(&mut self, cx: &mut Context<Self>) {
+        cx.open_url(REPOSITORY_URL);
+    }
+
+    pub fn copy_repository_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(REPOSITORY_URL.to_string()));
+        self.about_copied = true;
+        self.about_copied_epoch = self.about_copied_epoch.wrapping_add(1);
+        let epoch = self.about_copied_epoch;
+        let this = cx.weak_entity();
+        // "已复制" turns back into "复制" after a moment.
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1600))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.about_copied_epoch == epoch {
+                        this.about_copied = false;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
         cx.notify();
     }
 
@@ -1260,7 +1774,9 @@ impl AppState {
     fn saved_before_switch(&mut self, cx: &mut Context<Self>) -> bool {
         self.flush_pending_save(cx);
         self.retry_pending_save(cx);
-        if self.pending_save.is_some() {
+        // A quick note being written is unsaved text just the same.
+        let quick_saved = !matches!(self.quick_write(cx), quick::Written::Failed);
+        if self.pending_save.is_some() || !quick_saved {
             self.storage_note = Some(StorageNote::Error(
                 "当前便签还没有保存成功（数据库被占用），请稍后再试".into(),
             ));
@@ -1343,6 +1859,9 @@ impl AppState {
             return;
         }
 
+        // The quick note was writing into the database that is being left
+        // (where its text is saved by now); its session ends with it.
+        self.quick_close(cx);
         let old_path = self.store.path().to_path_buf();
         self.store = adopted;
         // Different notes from here on: what a running sync pass computed and
@@ -1432,7 +1951,8 @@ impl AppState {
     // --- WebDAV sync ---
 
     pub fn test_webdav(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.persist_settings(cx);
+        debug_log("ui: 测试连接 clicked");
+        let _ = self.persist_settings(cx);
         let cfg = self.config.webdav.clone();
         if cfg.url.trim().is_empty() || cfg.username.trim().is_empty() || cfg.password.is_empty()
         {
@@ -1463,24 +1983,43 @@ impl AppState {
 
     /// One WebDAV sync in the background. Silent when not configured.
     ///
-    /// `force` ignores the version cache and re-creates the collection; the
-    /// manual “立即同步” button uses it.
+    /// [`SyncPass::Forced`] ignores the version cache and re-creates the
+    /// collection; the manual “立即同步” button uses it.
     pub fn start_webdav_sync(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-        force: bool,
+        pass: SyncPass,
     ) {
+        debug_log(&format!("ui: sync requested pass={:?}", pass));
+        // A pass the user caused replaces the "test connection" line in the
+        // settings row. That line renders with priority over sync messages,
+        // so without this an old 连接成功 would hide every later sync result
+        // for the rest of the visit.
+        if !pass.quiet() && self.webdav_test != WebDavTest::Idle {
+            self.webdav_test = WebDavTest::Idle;
+            cx.notify();
+        }
         if self.webdav_syncing {
             // Coalesce: run one more pass when the current one finishes.
             self.webdav_pending = true;
+            if !pass.quiet() {
+                // A visible pass was asked for meanwhile. If a quiet one is
+                // running, show it now; the pass it queues up runs as asked.
+                if self.webdav_quiet {
+                    self.webdav_quiet = false;
+                    self.webdav_message = Some("正在同步…".into());
+                }
+                self.webdav_pending_force |= pass.force();
+                cx.notify();
+            }
             return;
         }
         if self.show_settings {
-            self.persist_settings(cx);
+            let _ = self.persist_settings(cx);
         }
         if !self.config.webdav_configured() {
-            if self.show_settings {
+            if self.show_settings && !pass.quiet() {
                 self.webdav_message = Some("请先填写服务器地址、用户名和密码".into());
                 cx.notify();
             }
@@ -1506,16 +2045,25 @@ impl AppState {
             Err(e) => {
                 self.webdav_next_try = Instant::now() + Duration::from_secs(30);
                 self.webdav_message = Some(format!("同步失败：{e}"));
-                self.status = SyncStatus::Error(format!("WebDAV 同步失败：{e}"));
+                self.webdav_failed = true;
+                if !pass.quiet() {
+                    self.status = SyncStatus::Error(format!("WebDAV 同步失败：{e}"));
+                }
                 cx.notify();
                 return;
             }
         };
 
         self.webdav_syncing = true;
+        self.webdav_quiet = pass.quiet();
         self.webdav_pending = false;
-        self.webdav_message = Some("正在同步…".into());
+        self.webdav_pending_force = false;
+        self.webdav_last_pass = Some(Instant::now());
+        if !pass.quiet() {
+            self.webdav_message = Some("正在同步…".into());
+        }
         let cfg = self.config.webdav.clone();
+        let force = pass.force();
         let cache = if force {
             webdav::SyncCache::default()
         } else {
@@ -1523,9 +2071,22 @@ impl AppState {
         };
         let ensure_dir = force || !self.webdav_dir_ready;
         let ledger = self.webdav_deletions.clone();
+        // Ids already in the ledger when this pass starts. Anything recorded
+        // while it runs (a delete during an in-flight sync) is not in the
+        // snapshot and must survive the pass's pruned ledger.
+        let deletions_before: std::collections::BTreeSet<String> =
+            ledger.deleted.keys().cloned().collect();
         let generation = self.store_generation;
         let this = cx.weak_entity();
         cx.notify();
+        debug_log(&format!(
+            "webdav pass start quiet={} force={} ensure={} notes={} pending={}",
+            pass.quiet(),
+            force,
+            ensure_dir,
+            notes.len(),
+            self.webdav_pending
+        ));
 
         window
             .spawn(cx, async move |cx: &mut AsyncWindowContext| {
@@ -1537,7 +2098,7 @@ impl AppState {
                     })
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.finish_webdav_sync(result, generation, window, cx);
+                    this.finish_webdav_sync(result, generation, deletions_before, window, cx);
                 });
             })
             .detach();
@@ -1550,15 +2111,15 @@ impl AppState {
         }
         self.webdav_epoch = self.webdav_epoch.wrapping_add(1);
         let epoch = self.webdav_epoch;
+        // How long to wait is the user's choice (settings › 通用).
+        let delay = self.config.sync_delay();
         let this = cx.weak_entity();
         window
             .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(2500))
-                    .await;
+                cx.background_executor().timer(delay).await;
                 let _ = this.update_in(cx, |this, window, cx| {
                     if this.webdav_epoch == epoch {
-                        this.start_webdav_sync(window, cx, false);
+                        this.start_webdav_sync(window, cx, SyncPass::Visible);
                     }
                 });
             })
@@ -1582,6 +2143,7 @@ impl AppState {
                         .collect(),
                     pinned: self.is_pinned(&note.id),
                     updated_at: note.updated_at,
+                    meta_updated_at: note.meta_updated_at,
                     markdown: note.markdown,
                     id: note.id,
                 }
@@ -1593,19 +2155,36 @@ impl AppState {
         &mut self,
         result: Result<webdav::SyncOutcome, String>,
         generation: u64,
+        deletions_before: std::collections::BTreeSet<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.webdav_syncing = false;
+        // Read once: a manual request during a quiet pass turns it visible.
+        let quiet = std::mem::take(&mut self.webdav_quiet);
+        // A pass snapshots the ledger when it starts, so a note deleted while
+        // it was in flight is not in the pruned ledger it hands back.
+        // Re-apply those intents or the next pass would re-import the remote
+        // `.md` and resurrect the note.
+        let deletions_during = self.webdav_deletions.added_since(&deletions_before);
         if generation != self.store_generation {
             // The database was switched while this pass ran: its decisions
             // were made for other notes, so they are dropped. What it removed
             // from the server is still a fact, though.
             if let Ok(outcome) = result {
-                self.webdav_deletions = outcome.ledger;
-                let _ = self.webdav_deletions.save();
+                let mut ledger = outcome.ledger;
+                // Settings changed while the pass ran: its ledger belongs to
+                // the previous target, so keep the one already in memory.
+                if ledger.matches(&self.config.webdav) {
+                    for (id, at) in &deletions_during {
+                        ledger.deleted.insert(id.clone(), *at);
+                    }
+                    self.webdav_deletions = ledger;
+                    let _ = self.webdav_deletions.save();
+                }
             }
             self.webdav_pending = false;
+            self.webdav_pending_force = false;
             self.webdav_message = None;
             self.schedule_webdav_sync(window, cx);
             cx.notify();
@@ -1615,11 +2194,19 @@ impl AppState {
             Ok(outcome) => {
                 let previous_cache = std::mem::replace(&mut self.webdav_cache, outcome.cache);
                 let _ = self.webdav_cache.save();
-                self.webdav_deletions = outcome.ledger;
-                let _ = self.webdav_deletions.save();
+                let mut ledger = outcome.ledger;
+                // Settings changed while the pass ran: its ledger belongs to
+                // the previous target, so keep the one already in memory.
+                if ledger.matches(&self.config.webdav) {
+                    for (id, at) in &deletions_during {
+                        ledger.deleted.insert(id.clone(), *at);
+                    }
+                    self.webdav_deletions = ledger;
+                    let _ = self.webdav_deletions.save();
+                }
                 self.webdav_dir_ready = true;
                 self.webdav_failures = 0;
-                self.webdav_next_try = Instant::now() + Duration::from_secs(60);
+                self.webdav_next_try = Instant::now() + self.pull_interval_now();
 
                 let report = outcome.report;
                 debug_log(&format!(
@@ -1635,6 +2222,7 @@ impl AppState {
                 // applied, so that newer local edits are recognised as such.
                 if !report.deleted_local.is_empty() || !report.remote_notes.is_empty() {
                     self.flush_pending_save(cx);
+                    self.quick_write(cx);
                 }
                 let mut changed = false;
                 let mut write_error = None;
@@ -1648,7 +2236,9 @@ impl AppState {
                         .files
                         .get(&format!("{id}.md"))
                         .map(|file| file.updated_at);
-                    let current = self.notes.iter().find(|n| &n.id == id).map(|n| n.updated_at);
+                    // The note's version: a colour, tag or pin change counts
+                    // as an edit in its own right.
+                    let current = self.store.note_version(id).ok().flatten();
                     if matches!((current, last_synced), (Some(now), Some(then)) if now > then) {
                         debug_log(&format!("webdav tombstone skipped (edited) id={}", short_id(id)));
                         continue;
@@ -1667,6 +2257,16 @@ impl AppState {
                 }
 
                 for note in &report.remote_notes {
+                    // Deleted here while the pass was comparing: the merged
+                    // ledger removes this remote file on the next pass, so do
+                    // not let the download bring the note back now.
+                    if deletions_during.contains_key(&note.id) {
+                        debug_log(&format!(
+                            "webdav remote skipped (deleted during pass) id={}",
+                            short_id(&note.id)
+                        ));
+                        continue;
+                    }
                     // A note that became newer here while the pass ran keeps
                     // its text (`apply_remote` returns false).
                     let applied = self.store.apply_remote(&RemoteUpdate {
@@ -1674,6 +2274,7 @@ impl AppState {
                         markdown: &note.markdown,
                         theme: &note.color,
                         updated_at: note.updated_at,
+                        meta_updated_at: note.meta_updated_at,
                         tags: &note.tags,
                         pinned: note.pinned,
                     });
@@ -1692,30 +2293,141 @@ impl AppState {
 
                 if changed {
                     // Show what arrived (or disappeared) right away.
-                    self.reload(window, cx);
+                    self.refresh_after_remote(window, cx);
                 }
                 let summary = report.summary();
-                self.webdav_message = Some(summary.clone());
-                self.status = match write_error {
-                    Some(e) => SyncStatus::Error(e),
-                    None => SyncStatus::Saved(summary),
-                };
+                let touched = report.uploaded
+                    + report.downloaded
+                    + report.deleted_remote
+                    + report.deleted_local.len()
+                    > 0;
+                // A quiet pass that found nothing to do says nothing: the
+                // status line belongs to what the user did, not to the poll.
+                if !quiet || touched || write_error.is_some() {
+                    self.webdav_message = Some(summary.clone());
+                }
+                if let Some(e) = write_error {
+                    self.status = SyncStatus::Error(e);
+                } else if !quiet || touched {
+                    self.status = SyncStatus::Saved(summary);
+                }
+                self.webdav_failed = false;
             }
             Err(e) => {
                 self.webdav_failures = self.webdav_failures.saturating_add(1);
+                debug_log(&format!(
+                    "webdav pass failed quiet={} failures={} next={}s msg={}",
+                    quiet,
+                    self.webdav_failures,
+                    (30u64 << self.webdav_failures.saturating_sub(1).min(5)).min(600),
+                    e
+                ));
                 // 30s, 60s, 120s, 240s, 480s, then 10 minutes — a down or
                 // unreachable server is not retried every minute.
                 let shift = self.webdav_failures.saturating_sub(1).min(5);
                 let secs = (30u64 << shift).min(600);
                 self.webdav_next_try = Instant::now() + Duration::from_secs(secs);
-                self.webdav_message = Some(format!("同步失败：{e}"));
-                self.status = SyncStatus::Error(format!("WebDAV 同步失败：{e}"));
+                // Say it once, and say it now: the red dot keeps saying it
+                // until a pass succeeds, so the failure is never missed.
+                if !quiet || self.show_settings {
+                    self.webdav_message = Some(format!("同步失败：{e}"));
+                    self.status = SyncStatus::Error(format!("WebDAV 同步失败：{e}"));
+                } else {
+                    self.webdav_message = Some(format!("同步失败：{e}"));
+                }
+                self.webdav_failed = true;
             }
         }
         if self.webdav_pending {
-            // Work arrived while this pass was running; pick it up soon.
+            // Work arrived while this pass was running; pick it up soon. A
+            // manual request runs at once, as it was asked to.
             self.webdav_pending = false;
-            self.schedule_webdav_sync(window, cx);
+            if std::mem::take(&mut self.webdav_pending_force) {
+                self.start_webdav_sync(window, cx, SyncPass::Forced);
+            } else {
+                self.schedule_webdav_sync(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// How long until the next background pull: the user's interval, and at
+    /// least ten minutes while the main window stays hidden in the tray.
+    fn pull_interval_now(&self) -> Duration {
+        let interval = self.config.pull_interval();
+        let visible = self.main_hwnd.map(win::is_visible).unwrap_or(true);
+        if visible {
+            interval
+        } else {
+            interval.max(Duration::from_secs(600))
+        }
+    }
+
+    /// Bring the list, tags and pins in line with the database after a pass
+    /// wrote to it. The open note keeps its editor — caret, focus and undo
+    /// history — unless its own text changed, in which case the editor is
+    /// rebuilt and the focus put back where it was.
+    fn refresh_after_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.store.list_notes() {
+            Ok(notes) => self.notes = notes,
+            Err(e) => self.status = SyncStatus::Error(format!("读取便签失败：{e}")),
+        }
+        self.reload_tags_cache();
+
+        let Some(id) = self.selected_id.clone() else {
+            self.select_note_by_index(0, window, cx);
+            return;
+        };
+        if !self.filtered_notes().iter().any(|n| n.id == id) {
+            // The note vanished — deleted on another device, or now hidden by
+            // the tag or search filter.
+            self.clear_selection();
+            self.select_note_by_index(0, window, cx);
+            return;
+        }
+
+        // Only this note's stored text can force a rebuild: the pass was
+        // applied after a flush, so the editor holds exactly what was saved
+        // unless the note itself was replaced by a remote version.
+        let stored = self.store.note_markdown(&id).ok().flatten();
+        if stored.as_deref() == Some(self.compose_md(cx).as_str()) {
+            cx.notify();
+            return;
+        }
+        let editor_focused = self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(window));
+        let title_focused = self
+            .title_input
+            .as_ref()
+            .is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window));
+        // Drop any debounce captured against the editor being replaced.
+        self.save_epoch = self.save_epoch.wrapping_add(1);
+        self.clear_selection();
+        self.select_note(&id, window, cx);
+        let handle = if editor_focused {
+            self.editor.as_ref().map(|e| e.read(cx).focus_handle(cx))
+        } else if title_focused {
+            self.title_input.as_ref().map(|i| i.read(cx).focus_handle(cx))
+        } else {
+            None
+        };
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Change how often the background loop checks for other devices'
+    /// changes. The new rhythm starts right away.
+    pub fn set_pull_interval(&mut self, secs: u64, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        let secs = config::clamp_pull_interval_secs(secs);
+        if self.config.pull_interval_secs != secs {
+            self.config.pull_interval_secs = secs;
+            let _ = self.config.save();
+            self.webdav_next_try = Instant::now();
         }
         cx.notify();
     }

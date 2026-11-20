@@ -69,9 +69,12 @@ pub(super) fn import_notes_in(
     let mut report = ImportReport::default();
     for native in notes {
         let normalized = plum::normalize(&native.text);
+        // `updated_at` here is the note's version: the newest change of any
+        // kind, colour, tags and pin included.
         let ours: Option<(String, i64, Option<i64>)> = conn
             .query_row(
-                "SELECT markdown, updated_at, deleted_at FROM note WHERE id = ?1",
+                "SELECT markdown, MAX(updated_at, meta_updated_at), deleted_at \
+                 FROM note WHERE id = ?1",
                 params![native.id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -273,6 +276,27 @@ mod tests {
     }
 
     #[test]
+    fn a_colour_picked_here_after_the_native_edit_keeps_our_copy() {
+        let store = NoteStore::open_in_memory().unwrap();
+        import_notes(&store, &[native(A, &plum_text(&["原文"]), 300)], &ShadowMarkdown::default())
+            .unwrap();
+        // Our newest change, the colour, is later than the native edit. The
+        // whole note goes by its newest change, as in sync; taking the native
+        // text with an older timestamp would leave this copy different from
+        // the one on the server under the same version.
+        assert!(store.set_theme(A, "Green").unwrap());
+        let report = import_notes(
+            &store,
+            &[native(A, &plum_text(&["在原生便签里改了"]), 400)],
+            &ShadowMarkdown::default(),
+        )
+        .unwrap();
+        assert_eq!(report, ImportReport { added: 0, updated: 0, unchanged: 1 });
+        let note = &store.live_notes().unwrap()[0];
+        assert_eq!((note.markdown.as_str(), note.theme.as_str()), ("原文", "Green"));
+    }
+
+    #[test]
     fn a_native_edit_older_than_our_copy_loses_and_is_not_offered_again() {
         let store = NoteStore::open_in_memory().unwrap();
         import_notes(&store, &[native(A, &plum_text(&["原文"]), 300)], &ShadowMarkdown::default())
@@ -316,6 +340,7 @@ mod tests {
                 markdown: md,
                 theme: "Green",
                 updated_at: 300,
+                meta_updated_at: 0,
                 tags: &[],
                 pinned: false,
             })

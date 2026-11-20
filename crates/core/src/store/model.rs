@@ -23,7 +23,17 @@ pub struct Note {
     pub markdown: String,
     pub theme: String,
     pub created_at: i64,
+    /// Last change to the text; the note list is ordered by it.
     pub updated_at: i64,
+    /// Last change to the colour, tags or pin made on its own, 0 if none.
+    pub meta_updated_at: i64,
+}
+
+impl Note {
+    /// The note's version for sync: its newest change of any kind.
+    pub fn version(&self) -> i64 {
+        self.updated_at.max(self.meta_updated_at)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +52,15 @@ pub struct RemoteUpdate<'a> {
     /// note look newer than the file it came from, and the two devices would
     /// upload it back and forth forever.
     pub updated_at: i64,
+    /// Kept as-is for the same reason.
+    pub meta_updated_at: i64,
     pub tags: &'a [String],
     pub pinned: bool,
+}
+
+impl RemoteUpdate<'_> {
+    /// The version's newest change of any kind, as in [`Note::version`].
+    pub fn version(&self) -> i64 {
+        self.updated_at.max(self.meta_updated_at)
+    }
 }

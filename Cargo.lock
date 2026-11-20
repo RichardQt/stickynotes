@@ -6840,20 +6840,23 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stickynotes-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "embed-resource",
+ "futures",
  "gpui-kit",
  "gpui-kit-markdown-editor",
+ "raw-window-handle",
  "resvg 0.46.0",
  "stickynotes-core",
  "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]
 name = "stickynotes-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "reqwest",
