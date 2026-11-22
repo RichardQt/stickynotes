@@ -386,7 +386,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.close_behavior = CloseBehavior::Tray;
         cfg.sync_delay_ms = 10_000;
-        cfg.shortcuts.insert("new_note".into(), "Ctrl+Alt+N".into());
+        cfg.shortcuts.insert("search".into(), "Ctrl+Alt+N".into());
         cfg.shortcuts.insert("md_bold".into(), String::new());
         cfg.tray_hint_shown = true;
         let text = serde_json::to_string(&cfg).unwrap();

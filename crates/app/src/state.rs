@@ -442,6 +442,9 @@ pub struct AppState {
     pub recording_shortcut: Option<&'static str>,
     /// Why the last recorded combination was refused, and for which action.
     pub shortcut_error: Option<(&'static str, String)>,
+    /// Why the system-wide quick-note key is not in effect although one is
+    /// set — typically another program holds the same keys.
+    pub hotkey_problem: Option<&'static str>,
 
     // Notification area and quick note
     /// `None` when there is no notification-area icon to come back from:
@@ -449,6 +452,13 @@ pub struct AppState {
     tray: Option<win::Tray>,
     /// Native handle of the main window, for hiding and showing it.
     main_hwnd: Option<isize>,
+    /// The main window was created hidden (a start at sign-in, straight into
+    /// the notification area) and has not been on screen yet.
+    awaiting_first_show: bool,
+    /// Windows starts the app at sign-in. Mirrors the system's own entry.
+    pub autostart: bool,
+    /// Why that entry could not be changed.
+    pub autostart_error: Option<String>,
     pub(crate) quick: Option<QuickHost>,
     /// The quick note is shown as a card in the main window — the fallback
     /// when it has no window of its own.
@@ -457,8 +467,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let config = AppConfig::load();
+    /// `hidden`: the window was created without being shown.
+    pub fn new(hidden: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut config = AppConfig::load();
+        // A shortcut stored for an action that no longer exists (新建便签 had
+        // one) is forgotten: it would count as a change nobody can see.
+        config.shortcuts.retain(|action, _| shortcuts::action_def(action).is_some());
         let (store, startup_error) = match open_configured_database(&config) {
             Ok(store) => (store, None),
             Err(e) => {
@@ -560,8 +574,12 @@ impl AppState {
             keymap,
             recording_shortcut: None,
             shortcut_error: None,
+            hotkey_problem: None,
             tray: None,
             main_hwnd: win::hwnd_of(window),
+            awaiting_first_show: hidden,
+            autostart: win::autostart_enabled(),
+            autostart_error: None,
             quick: None,
             quick_overlay_open: false,
             quick_session: QuickSession::default(),
@@ -1364,11 +1382,14 @@ impl AppState {
         self.webdav_test = WebDavTest::Idle;
         self.pending_adopt = None;
         self.settings_menu = None;
-        self.recording_shortcut = None;
+        self.set_recording(None);
         self.shortcut_error = None;
         self.confirm_clear = None;
         self.danger_note = None;
         self.about_copied = false;
+        // It may have been switched off in Task Manager since the last look.
+        self.autostart = win::autostart_enabled();
+        self.autostart_error = None;
         // The delay field shows the delay in effect, not a refused leftover
         // from the last visit.
         self.delay_error = None;
@@ -1403,7 +1424,7 @@ impl AppState {
         }
         self.settings_page = page;
         self.settings_menu = None;
-        self.recording_shortcut = None;
+        self.set_recording(None);
         self.shortcut_error = None;
         // A field of the page that was left must not keep the caret.
         window.focus(&self.modal_focus, cx);
@@ -1534,7 +1555,7 @@ impl AppState {
         self.show_settings = false;
         self.pending_adopt = None;
         self.settings_menu = None;
-        self.recording_shortcut = None;
+        self.set_recording(None);
         self.shortcut_error = None;
         self.confirm_clear = None;
         // Return focus from the unmounting modal fields back to the open note.
@@ -1572,7 +1593,7 @@ impl AppState {
             return;
         }
         self.settings_menu = None;
-        self.recording_shortcut = None;
+        self.set_recording(None);
         self.confirm_clear = Some(Instant::now());
         self.confirm_clear_count = self.notes.len();
         window.focus(&self.modal_focus, cx);

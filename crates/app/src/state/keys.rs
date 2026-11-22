@@ -145,6 +145,12 @@ impl AppState {
             return;
         };
         match action.group {
+            // Normally Windows takes these keys before the window sees them.
+            // They only arrive here when it could not be given them.
+            Group::Global => {
+                cx.stop_propagation();
+                self.open_quick_note(window, cx);
+            }
             Group::General => {
                 cx.stop_propagation();
                 self.run_general_action(action.id, window, cx);
@@ -186,7 +192,7 @@ impl AppState {
                     cx.stop_propagation();
                     run_md_action(&editor, action.id, cx);
                 }
-                // The app-wide actions (new note, search, …) belong to the
+                // The app-wide actions (new tag, search, …) belong to the
                 // main panel and do nothing while a quick note is written.
                 (Some(_), _) => cx.stop_propagation(),
                 (None, _) if is_editor_builtin(combo) => cx.stop_propagation(),
@@ -197,14 +203,6 @@ impl AppState {
 
     fn run_general_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
         match action {
-            shortcuts::NEW_NOTE => {
-                self.new_note(window, cx);
-                // Ready to type: the caret goes into the new note's title.
-                if let Some(title) = &self.title_input {
-                    let handle = title.read(cx).focus_handle(cx);
-                    window.focus(&handle, cx);
-                }
-            }
             shortcuts::NEW_TAG => self.begin_new_tag(window, cx),
             shortcuts::SEARCH => {
                 if let Some(search) = &self.search_input {
@@ -227,16 +225,27 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         self.shortcut_error = None;
-        self.recording_shortcut = (self.recording_shortcut != Some(action)).then_some(action);
+        self.set_recording((self.recording_shortcut != Some(action)).then_some(action));
         // The key presses must not end up in a text field.
         window.focus(&self.modal_focus, cx);
         cx.notify();
     }
 
     pub fn cancel_shortcut_recording(&mut self, cx: &mut Context<Self>) {
-        if self.recording_shortcut.take().is_some() {
+        if self.recording_shortcut.is_some() {
+            self.set_recording(None);
             self.shortcut_error = None;
             cx.notify();
+        }
+    }
+
+    /// Start (`Some`) or stop listening for a new shortcut. The system-wide
+    /// key is given up for that long and taken again afterwards.
+    pub(super) fn set_recording(&mut self, action: Option<&'static str>) {
+        let was_recording = self.recording_shortcut.is_some();
+        self.recording_shortcut = action;
+        if was_recording != action.is_some() {
+            self.apply_global_hotkey();
         }
     }
 
@@ -249,7 +258,7 @@ impl AppState {
     ) {
         let key = combo.key();
         if plain && key == "escape" {
-            self.recording_shortcut = None;
+            self.set_recording(None);
             self.shortcut_error = None;
             cx.notify();
             return;
@@ -258,9 +267,9 @@ impl AppState {
         let wanted = (!(plain && matches!(key, "backspace" | "delete"))).then_some(combo);
         match shortcuts::assign(&mut self.config.shortcuts, action, wanted) {
             Ok(()) => {
-                self.recording_shortcut = None;
                 self.shortcut_error = None;
                 self.shortcuts_changed();
+                self.set_recording(None);
             }
             // Keep listening: the next key press is another try.
             Err(error) => self.shortcut_error = Some((action, error.message())),
@@ -269,7 +278,7 @@ impl AppState {
     }
 
     pub fn reset_shortcut(&mut self, action: &'static str, cx: &mut Context<Self>) {
-        self.recording_shortcut = None;
+        self.set_recording(None);
         match shortcuts::reset(&mut self.config.shortcuts, action) {
             Ok(()) => {
                 self.shortcut_error = None;
@@ -281,7 +290,7 @@ impl AppState {
     }
 
     pub fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
-        self.recording_shortcut = None;
+        self.set_recording(None);
         self.shortcut_error = None;
         self.config.shortcuts.clear();
         self.shortcuts_changed();
@@ -291,6 +300,8 @@ impl AppState {
     /// The stored changes were edited: apply them and write them down.
     fn shortcuts_changed(&mut self) {
         self.keymap = shortcuts::Keymap::resolve(&self.config.shortcuts);
+        // The quick-note key may be among them.
+        self.apply_global_hotkey();
         if let Err(e) = self.config.save() {
             self.status = SyncStatus::Error(format!("保存设置失败：{e}"));
         }

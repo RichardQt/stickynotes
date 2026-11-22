@@ -1,11 +1,13 @@
-//! What surrounds the notes: the notification-area icon, what closing the
-//! main window does, and quitting.
+//! What surrounds the notes: the notification-area icon and its menu, the
+//! system-wide quick-note key, starting with Windows, what closing the main
+//! window does, and quitting.
 
 use super::AppState;
 use crate::win::{self, TrayEvent};
 use futures::StreamExt as _;
 use gpui_kit::*;
 use stickynotes_core::config::CloseBehavior;
+use stickynotes_core::shortcuts;
 
 impl AppState {
     /// Hook the app state up to the window and the system: keyboard
@@ -39,6 +41,7 @@ impl AppState {
                 tray.show_icon();
             }
             self.tray = Some(tray);
+            self.apply_global_hotkey();
             let this = cx.weak_entity();
             window
                 .spawn(cx, async move |cx: &mut AsyncWindowContext| {
@@ -53,6 +56,15 @@ impl AppState {
                     }
                 })
                 .detach();
+        }
+
+        // Started at sign-in, the window stays out of the way — as long as
+        // there is an icon to bring it back and notes for it to show.
+        let in_tray = self.tray_available()
+            && self.config.close_behavior == CloseBehavior::Tray
+            && self.startup_error.is_none();
+        if self.awaiting_first_show && !in_tray {
+            self.reveal_main(window, cx);
         }
 
         // Quitting while the window is merely hidden: nothing else writes
@@ -78,6 +90,33 @@ impl AppState {
         match event {
             TrayEvent::QuickNote => self.open_quick_note(window, cx),
             TrayEvent::ShowMain => self.show_main(window, cx),
+            TrayEvent::OpenSettings => {
+                self.show_main(window, cx);
+                // Not over another dialog, and not a second time: opening
+                // the settings starts them afresh.
+                let free = self.startup_error.is_none()
+                    && !self.show_settings
+                    && !self.quick_overlay_open;
+                if free {
+                    self.open_settings(window, cx);
+                }
+            }
+            TrayEvent::Quit => self.quit_app(window, cx),
+        }
+    }
+
+    /// Hand the quick-note key to Windows, which then reports it from any
+    /// program. While a shortcut is being recorded there is no such key:
+    /// every key press has to reach the settings page instead.
+    pub(super) fn apply_global_hotkey(&mut self) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        if self.recording_shortcut.is_some() {
+            let _ = tray.set_hotkey(None);
+        } else {
+            let combo = self.keymap.combo(shortcuts::QUICK_NOTE);
+            self.hotkey_problem = tray.set_hotkey(combo).err();
         }
     }
 
@@ -113,6 +152,19 @@ impl AppState {
     /// Bring the main window back from the notification area (or from
     /// behind other windows).
     pub fn show_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_main(window, cx);
+        // Freshen the notes the moment the window is back, not a whole pull
+        // interval later.
+        self.pull_on_return(window, cx);
+    }
+
+    /// Put the main window on screen, in front.
+    fn reveal_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.awaiting_first_show) {
+            // A window created hidden gets its size and position from the
+            // toolkit only when that first activates it.
+            window.activate_window();
+        }
         match self.main_hwnd {
             // Showing a window makes the system call back into it at once,
             // which must not happen in the middle of an update: do it from a
@@ -122,9 +174,16 @@ impl AppState {
                 .detach(),
             None => window.activate_window(),
         }
-        // Freshen the notes the moment the window is back, not a whole pull
-        // interval later.
-        self.pull_on_return(window, cx);
+    }
+
+    /// The "开机自启动" switch of the settings.
+    pub fn set_autostart(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.autostart_error = win::set_autostart(on).err().map(|e| {
+            format!("无法{}开机自启动：{e}", if on { "开启" } else { "关闭" })
+        });
+        // Whatever was asked for, the switch shows what the system holds.
+        self.autostart = win::autostart_enabled();
+        cx.notify();
     }
 
     /// "退出应用" in the settings: the only way out while closing the

@@ -430,7 +430,11 @@ impl AppState {
         let page = self.settings_page;
 
         let (title, subtitle, body_id) = match page {
-            SettingsPage::General => ("通用", "同步、窗口行为与数据存储", "settings-body-general"),
+            SettingsPage::General => (
+                "通用",
+                "启动、窗口行为、同步与数据存储",
+                "settings-body-general",
+            ),
             SettingsPage::Shortcuts => (
                 "快捷键",
                 "点击按键框，再按下新的组合键",
@@ -776,7 +780,7 @@ impl AppState {
             .child(
                 v_flex()
                     .gap(px(7.))
-                    .child(section_title("窗口"))
+                    .child(section_title("启动与窗口"))
                     .child(self.render_window_group(window, cx)),
             )
             .child(
@@ -799,7 +803,8 @@ impl AppState {
             )
     }
 
-    /// What closing the window does, and the way out of the app.
+    /// Starting with Windows, what closing the window does, and the way out
+    /// of the app.
     fn render_window_group(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let tray = self.tray_available();
         let behavior = if tray {
@@ -811,7 +816,7 @@ impl AppState {
         let (current, detail) = match behavior {
             CloseBehavior::Tray => (
                 "留在托盘",
-                "关闭后留在托盘并继续同步；左键点托盘图标快速记事，右键打开主面板。",
+                "关闭后留在托盘并继续同步；左键点托盘图标快速记事，右键打开菜单。",
             ),
             CloseBehavior::Quit if tray => ("直接退出", "关闭窗口即退出便签，后台同步随之停止。"),
             CloseBehavior::Quit => (
@@ -964,7 +969,44 @@ impl AppState {
                 )
             });
 
+        let autostart_detail = match behavior {
+            CloseBehavior::Tray => "登录 Windows 后自动启动，直接留在托盘，不打开窗口。",
+            CloseBehavior::Quit if tray => {
+                "登录 Windows 后自动启动并打开窗口；“关闭窗口时”选“留在托盘”后，改为直接留在托盘。"
+            }
+            CloseBehavior::Quit => "登录 Windows 后自动启动并打开窗口。",
+        };
+
         group_card()
+            .child(
+                v_flex()
+                    .py(px(12.))
+                    .gap(px(7.))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .gap_3()
+                            .child(setting_text("开机自启动", autostart_detail))
+                            .child(
+                                settings_switch(
+                                    "sw-autostart",
+                                    self.autostart,
+                                    rgb(ACCENT),
+                                    window,
+                                    cx,
+                                )
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    let on = !this.autostart;
+                                    this.set_autostart(on, cx);
+                                })),
+                            ),
+                    )
+                    .when_some(self.autostart_error.clone(), |el, message| {
+                        el.child(error_line(message).id("settings-autostart-error"))
+                    }),
+            )
+            .child(row_divider())
             .child(
                 h_flex()
                     .py(px(12.))
@@ -1646,6 +1688,7 @@ impl AppState {
         );
 
         let groups = [
+            (Group::Global, "全局（便签运行时，在任何程序里都生效）"),
             (Group::General, "通用"),
             (Group::Markdown, "Markdown 格式（在正文编辑区生效）"),
         ];
@@ -1693,7 +1736,12 @@ impl AppState {
             .shortcut_error
             .as_ref()
             .filter(|(owner, _)| *owner == action)
-            .map(|(_, message)| message.clone());
+            .map(|(_, message)| message.clone())
+            // The system-wide key is set, but Windows would not register it.
+            .or_else(|| {
+                let global = def.group == Group::Global && !recording;
+                self.hotkey_problem.filter(|_| global).map(str::to_string)
+            });
 
         let key_content: AnyElement = if recording {
             div()

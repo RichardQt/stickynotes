@@ -7,6 +7,7 @@ mod ui;
 mod win;
 
 use gpui_kit::*;
+use stickynotes_core::config::{AppConfig, CloseBehavior};
 
 fn main() {
     // Desktop panics otherwise vanish with the window; keep a one-line trace
@@ -61,8 +62,16 @@ fn main() {
             // quick note is a window of its own that stays around.
             cx.set_quit_mode(QuitMode::Explicit);
 
+            // Started by Windows at sign-in while closing the window means
+            // "stay in the notification area": come up there, without a
+            // window in the way.
+            let hidden = win::launched_at_login()
+                && AppConfig::load().close_behavior == CloseBehavior::Tray;
+
             let (main, _) = gpui_kit::open_window(
                 WindowOptions {
+                    show: !hidden,
+                    focus: !hidden,
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Point { x: px(120.), y: px(80.) },
                         size: size(px(1100.), px(720.)),
@@ -77,7 +86,7 @@ fn main() {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| state::AppState::new(window, cx)),
+                move |window, cx| cx.new(|cx| state::AppState::new(hidden, window, cx)),
             )
             .expect("failed to open window");
 

@@ -10,6 +10,9 @@ use std::fmt;
 /// Where an action is listed on the shortcut page, and when its key works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
+    /// Works in every program for as long as the app runs: Windows takes the
+    /// key press before any window sees it.
+    Global,
     /// Works anywhere in the main window.
     General,
     /// Formatting; works while the caret is in a note's body.
@@ -34,7 +37,7 @@ const fn action(
     ActionDef { id, label, group, default }
 }
 
-pub const NEW_NOTE: &str = "new_note";
+pub const QUICK_NOTE: &str = "quick_note";
 pub const NEW_TAG: &str = "new_tag";
 pub const SEARCH: &str = "search";
 pub const MD_PARAGRAPH: &str = "md_paragraph";
@@ -61,7 +64,7 @@ pub const MD_TABLE: &str = "md_table";
 /// those as the shifted character (`Ctrl+Shift+8` arrives as `Ctrl+*`), and
 /// `Ctrl+Shift+0` never arrives at all.
 pub const ACTIONS: &[ActionDef] = &[
-    action(NEW_NOTE, "新建便签", Group::General, "Ctrl+N"),
+    action(QUICK_NOTE, "快速记事", Group::Global, "Ctrl+Alt+Q"),
     action(NEW_TAG, "新建标签", Group::General, "Ctrl+Shift+N"),
     action(SEARCH, "搜索便签", Group::General, "Ctrl+F"),
     action(MD_PARAGRAPH, "正文", Group::Markdown, "Ctrl+Alt+0"),
@@ -477,22 +480,22 @@ mod tests {
     #[test]
     fn stored_changes_replace_remove_or_fall_back_to_defaults() {
         let keymap = Keymap::resolve(&overrides(&[
-            (NEW_NOTE, "Ctrl+Alt+N"),
+            (SEARCH, "Ctrl+Alt+N"),
             (MD_BOLD, ""),
             (MD_ITALIC, "not a key"),
             (MD_CODE, "Ctrl+C"),
             ("no_such_action", "Ctrl+J"),
         ]));
-        assert_eq!(keymap.label(NEW_NOTE).as_deref(), Some("Ctrl+Alt+N"));
-        assert!(!keymap.is_default(NEW_NOTE));
+        assert_eq!(keymap.label(SEARCH).as_deref(), Some("Ctrl+Alt+N"));
+        assert!(!keymap.is_default(SEARCH));
         assert_eq!(keymap.combo(MD_BOLD), None, "an empty change means no shortcut");
         assert!(!keymap.is_default(MD_BOLD));
         assert_eq!(keymap.label(MD_ITALIC).as_deref(), Some("Ctrl+I"), "unreadable → default");
         assert_eq!(keymap.label(MD_CODE).as_deref(), Some("Ctrl+E"), "not allowed → default");
-        assert_eq!(keymap.label(SEARCH).as_deref(), Some("Ctrl+F"));
+        assert_eq!(keymap.label(NEW_TAG).as_deref(), Some("Ctrl+Shift+N"));
 
-        assert_eq!(keymap.action_for(&combo("Ctrl+Alt+N")).map(|a| a.id), Some(NEW_NOTE));
-        assert_eq!(keymap.action_for(&combo("Ctrl+N")), None, "the old default is free again");
+        assert_eq!(keymap.action_for(&combo("Ctrl+Alt+N")).map(|a| a.id), Some(SEARCH));
+        assert_eq!(keymap.action_for(&combo("Ctrl+F")), None, "the old default is free again");
         assert_eq!(keymap.action_for(&combo("Ctrl+B")), None);
         assert_eq!(keymap.action_for(&combo("Ctrl+J")), None);
         assert_eq!(keymap.combo("no_such_action"), None);
@@ -522,8 +525,8 @@ mod tests {
     #[test]
     fn assigning_stores_only_differences_from_the_default() {
         let mut stored = BTreeMap::new();
-        assign(&mut stored, NEW_NOTE, Some(&combo("Ctrl+Alt+N"))).unwrap();
-        assert_eq!(stored, overrides(&[(NEW_NOTE, "Ctrl+Alt+N")]));
+        assign(&mut stored, SEARCH, Some(&combo("Ctrl+Alt+N"))).unwrap();
+        assert_eq!(stored, overrides(&[(SEARCH, "Ctrl+Alt+N")]));
 
         // No shortcut at all is a change too.
         assign(&mut stored, MD_BOLD, None).unwrap();
@@ -531,8 +534,8 @@ mod tests {
         assert_eq!(Keymap::resolve(&stored).combo(MD_BOLD), None);
 
         // Back on the default: nothing is stored for the action.
-        assign(&mut stored, NEW_NOTE, Some(&combo("Ctrl+N"))).unwrap();
-        assert!(!stored.contains_key(NEW_NOTE));
+        assign(&mut stored, SEARCH, Some(&combo("Ctrl+F"))).unwrap();
+        assert!(!stored.contains_key(SEARCH));
         reset(&mut stored, MD_BOLD).unwrap();
         assert!(stored.is_empty());
         assert_eq!(Keymap::resolve(&stored), Keymap::default());
@@ -543,17 +546,47 @@ mod tests {
     }
 
     #[test]
+    fn the_system_wide_quick_note_key_is_one_of_the_shortcuts() {
+        let quick = action_def(QUICK_NOTE).unwrap();
+        assert_eq!(quick.group, Group::Global);
+        assert_eq!(ACTIONS.iter().filter(|a| a.group == Group::Global).count(), 1);
+        assert_eq!(Keymap::default().label(QUICK_NOTE).as_deref(), Some("Ctrl+Alt+Q"));
+
+        // Its key presses never reach the window, so no other action may
+        // share them — until it has been moved or switched off.
+        let mut stored = BTreeMap::new();
+        assert_eq!(
+            assign(&mut stored, SEARCH, Some(&combo("Ctrl+Alt+Q"))),
+            Err(AssignError::Taken(quick))
+        );
+        assign(&mut stored, QUICK_NOTE, Some(&combo("Ctrl+Alt+J"))).unwrap();
+        assign(&mut stored, SEARCH, Some(&combo("Ctrl+Alt+Q"))).unwrap();
+        let keymap = Keymap::resolve(&stored);
+        assert_eq!(keymap.action_for(&combo("Ctrl+Alt+J")).map(|a| a.id), Some(QUICK_NOTE));
+        assert_eq!(keymap.action_for(&combo("Ctrl+Alt+Q")).map(|a| a.id), Some(SEARCH));
+
+        assign(&mut stored, QUICK_NOTE, None).unwrap();
+        assert_eq!(Keymap::resolve(&stored).combo(QUICK_NOTE), None);
+
+        // Keys someone already gave to another action stay with it: the
+        // quick note then simply has none until it is given some.
+        let keymap = Keymap::resolve(&overrides(&[(SEARCH, "Ctrl+Alt+Q")]));
+        assert_eq!(keymap.action_for(&combo("Ctrl+Alt+Q")).map(|a| a.id), Some(SEARCH));
+        assert_eq!(keymap.combo(QUICK_NOTE), None);
+    }
+
+    #[test]
     fn assigning_refuses_taken_and_disallowed_combinations() {
         let mut stored = BTreeMap::new();
-        let taken = assign(&mut stored, NEW_NOTE, Some(&combo("Ctrl+B"))).unwrap_err();
+        let taken = assign(&mut stored, SEARCH, Some(&combo("Ctrl+B"))).unwrap_err();
         assert_eq!(taken, AssignError::Taken(action_def(MD_BOLD).unwrap()));
         assert!(taken.message().contains("加粗"), "{}", taken.message());
         assert_eq!(
-            assign(&mut stored, NEW_NOTE, Some(&combo("Ctrl+C"))),
+            assign(&mut stored, SEARCH, Some(&combo("Ctrl+C"))),
             Err(AssignError::Invalid(ComboError::Reserved))
         );
         assert_eq!(
-            assign(&mut stored, NEW_NOTE, Some(&combo("N"))),
+            assign(&mut stored, SEARCH, Some(&combo("N"))),
             Err(AssignError::Invalid(ComboError::NeedsModifier))
         );
         assert_eq!(
@@ -565,12 +598,12 @@ mod tests {
 
         // Freeing the keys first makes them available…
         assign(&mut stored, MD_BOLD, None).unwrap();
-        assign(&mut stored, NEW_NOTE, Some(&combo("Ctrl+B"))).unwrap();
-        assert_eq!(Keymap::resolve(&stored).action_for(&combo("Ctrl+B")).map(|a| a.id), Some(NEW_NOTE));
+        assign(&mut stored, SEARCH, Some(&combo("Ctrl+B"))).unwrap();
+        assert_eq!(Keymap::resolve(&stored).action_for(&combo("Ctrl+B")).map(|a| a.id), Some(SEARCH));
         // …and then the old owner cannot simply be reset onto them.
         assert_eq!(
             reset(&mut stored, MD_BOLD),
-            Err(AssignError::Taken(action_def(NEW_NOTE).unwrap()))
+            Err(AssignError::Taken(action_def(SEARCH).unwrap()))
         );
         assert_eq!(Keymap::resolve(&stored).combo(MD_BOLD), None);
     }

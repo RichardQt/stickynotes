@@ -1,18 +1,23 @@
-//! Win32 pieces the UI toolkit does not cover: the notification-area icon,
-//! the single-instance guard, and hiding / showing / placing top-level
-//! windows.
+//! Win32 pieces the UI toolkit does not cover: the notification-area icon
+//! and its menu, the system-wide quick-note key, the single-instance guard,
+//! starting with Windows, and hiding / showing / placing top-level windows.
 //!
 //! Window handles travel as plain `isize` values so they can cross threads
 //! and sit in the app state.
 
-/// What the user did with the notification-area icon.
+/// What the user asked for through the notification-area icon, its
+/// right-click menu or the system-wide shortcut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
-    /// Left click: open the quick-note window.
+    /// Left click, the menu or the shortcut: open the quick-note window.
     QuickNote,
-    /// Right click — or the app was started a second time: show the main
+    /// The menu — or the app was started a second time: show the main
     /// window.
     ShowMain,
+    /// The menu: show the main window with the settings open.
+    OpenSettings,
+    /// The menu: quit the app.
+    Quit,
 }
 
 #[cfg(windows)]
@@ -27,6 +32,7 @@ mod imp {
     use std::cell::{Cell, RefCell};
     use std::ffi::c_void;
     use std::time::Duration;
+    use stickynotes_core::shortcuts::Combo;
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{
         GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -40,21 +46,28 @@ mod imp {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, VkKeyScanW, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+        MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_F1,
+    };
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_LARGE_ICON,
         NIIF_USER, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow,
-        DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
-        GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, LoadIconW,
-        LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-        SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync,
-        TranslateMessage, HICON, IDI_APPLICATION, IMAGE_ICON, LR_SHARED, MSG, SMTO_ABORTIFHUNG,
+        AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW,
+        GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW,
+        RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetMenuDefaultItem,
+        SetWindowPos, ShowWindow, ShowWindowAsync, TrackPopupMenu, TranslateMessage, HICON,
+        IDI_APPLICATION, IMAGE_ICON, LR_SHARED, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG,
         SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SWP_NOACTIVATE, SWP_NOSIZE,
-        SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SYSTEM_METRICS_INDEX, WINDOW_STYLE, WM_APP,
-        WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW,
+        SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SYSTEM_METRICS_INDEX, TPM_BOTTOMALIGN,
+        TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_DESTROY,
+        WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW,
     };
+    use windows_registry::CURRENT_USER;
 
     const CONTROL_CLASS: PCWSTR = w!("StickyNotesControl");
 
@@ -66,12 +79,24 @@ mod imp {
     /// Posted by a second instance of the app before it exits.
     const MSG_SHOW_MAIN: u32 = WM_APP + 5;
     const MSG_SHUTDOWN: u32 = WM_APP + 6;
+    /// Register the system-wide key in wParam (modifiers) and lParam (key
+    /// code, 0 for none) in place of the current one. Answers 1 when done.
+    const MSG_SET_HOTKEY: u32 = WM_APP + 7;
 
     const TRAY_ICON_ID: u32 = 1;
-    const TRAY_TIP: &str = "便签 · 左键快速记事，右键打开主面板";
+    const TRAY_TIP: &str = "便签 · 左键快速记事，右键打开菜单";
     const HINT_TITLE: &str = "便签仍在后台运行";
     const HINT_TEXT: &str =
-        "左键点击托盘图标快速记事，右键打开主面板。可在“设置 › 通用”里改为关闭窗口时直接退出。";
+        "左键点击托盘图标快速记事，右键打开菜单。可在“设置 › 通用”里改为关闭窗口时直接退出。";
+
+    /// The entries of the icon's right-click menu.
+    const MENU_SHOW_MAIN: usize = 1;
+    const MENU_QUICK_NOTE: usize = 2;
+    const MENU_SETTINGS: usize = 3;
+    const MENU_QUIT: usize = 4;
+
+    /// The one system-wide key of the control window.
+    const HOTKEY_ID: i32 = 1;
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
@@ -158,6 +183,82 @@ mod imp {
         }
     }
 
+    // --- Starting with Windows -------------------------------------------
+
+    /// The programs Windows starts when this user signs in.
+    fn run_key() -> String {
+        format!(r"{}\Run", run_root())
+    }
+
+    /// Where Task Manager and the Settings app note which of them the user
+    /// switched off there.
+    fn run_approved_key() -> String {
+        format!(r"{}\Explorer\StartupApproved\Run", run_root())
+    }
+
+    /// The key under `HKEY_CURRENT_USER` both of them sit in.
+    /// `STICKYNOTES_RUN_ROOT` names another one, to try the switch out
+    /// without registering anything with Windows.
+    fn run_root() -> String {
+        std::env::var("STICKYNOTES_RUN_ROOT")
+            .unwrap_or_else(|_| r"Software\Microsoft\Windows\CurrentVersion".into())
+    }
+
+    const RUN_VALUE: &str = "StickyNotes";
+    /// Tells a start by Windows at sign-in from one by the user.
+    const AUTOSTART_ARG: &str = "--autostart";
+
+    /// The command Windows is given to run at sign-in: this executable.
+    fn autostart_command() -> Option<String> {
+        let exe = std::env::current_exe().ok()?;
+        Some(format!("\"{}\" {AUTOSTART_ARG}", exe.to_str()?))
+    }
+
+    /// This process was started by Windows at sign-in.
+    pub fn launched_at_login() -> bool {
+        std::env::args_os().skip(1).any(|arg| arg == AUTOSTART_ARG)
+    }
+
+    /// Whether Windows starts this executable at sign-in. Read from the
+    /// system every time: the entry can also be switched off in Task Manager,
+    /// and it stops counting once the executable has moved.
+    pub fn autostart_enabled() -> bool {
+        let Some(command) = autostart_command() else {
+            return false;
+        };
+        let registered = CURRENT_USER
+            .open(run_key())
+            .and_then(|key| key.get_string(RUN_VALUE))
+            .is_ok_and(|stored| stored.eq_ignore_ascii_case(&command));
+        // An odd first byte means "disabled"; no value at all, "enabled".
+        let switched_off = CURRENT_USER
+            .open(run_approved_key())
+            .and_then(|key| key.get_value(RUN_VALUE))
+            .is_ok_and(|flags| flags.first().is_some_and(|byte| byte & 1 == 1));
+        registered && !switched_off
+    }
+
+    /// Add this executable to the programs started at sign-in, or take it
+    /// out again. The error is ready to be shown.
+    pub fn set_autostart(on: bool) -> Result<(), String> {
+        // A "disabled" noted by Task Manager outlives the entry it was about
+        // and would keep a new one from starting.
+        if let Ok(approved) = CURRENT_USER.options().write().open(run_approved_key()) {
+            let _ = approved.remove_value(RUN_VALUE);
+        }
+        let run = CURRENT_USER.create(run_key()).map_err(|e| e.message())?;
+        if on {
+            let command = autostart_command().ok_or("无法确定程序所在的位置")?;
+            run.set_string(RUN_VALUE, command).map_err(|e| e.message())
+        } else {
+            match run.remove_value(RUN_VALUE) {
+                // Nothing there to remove is just as good.
+                Err(_) if run.get_type(RUN_VALUE).is_err() => Ok(()),
+                result => result.map_err(|e| e.message()),
+            }
+        }
+    }
+
     // --- Notification-area icon ------------------------------------------
 
     /// The hidden control window and the notification-area icon. Both live on
@@ -193,6 +294,40 @@ mod imp {
         /// One-off balloon telling the user the app is still running.
         pub fn show_hint(&self) {
             self.post(MSG_HINT);
+        }
+
+        /// Make `combo` open the quick note from any program, in place of
+        /// the key that did so far; `None` leaves no such key. The error is
+        /// ready to be shown.
+        pub fn set_hotkey(&self, combo: Option<&Combo>) -> Result<(), &'static str> {
+            if self.closed.get() {
+                return Ok(());
+            }
+            let (modifiers, code) = match combo {
+                Some(combo) => {
+                    hotkey_parts(combo).ok_or("这个按键不能注册为全局快捷键，请换一个组合")?
+                }
+                None => (0, 0),
+            };
+            // Hot keys belong to the thread that registers them, and they are
+            // reported to the control window: its thread has to do it.
+            let mut registered = 0usize;
+            unsafe {
+                SendMessageTimeoutW(
+                    hwnd(self.control),
+                    MSG_SET_HOTKEY,
+                    WPARAM(modifiers as usize),
+                    LPARAM(code as isize),
+                    SMTO_ABORTIFHUNG,
+                    1500,
+                    Some(&mut registered),
+                );
+            }
+            if code == 0 || registered != 0 {
+                Ok(())
+            } else {
+                Err("这个组合键已被其他程序占用，当前不会生效，请换一个组合")
+            }
         }
 
         /// Remove the icon and end the control thread. Waits (briefly) until
@@ -384,6 +519,90 @@ mod imp {
         }
     }
 
+    /// Modifier flags and virtual-key code of `combo`, as Windows registers
+    /// hot keys. `None` for a key the current keyboard layout does not have.
+    fn hotkey_parts(combo: &Combo) -> Option<(u32, u32)> {
+        let key = combo.key();
+        let function_key = key.strip_prefix('f').and_then(|n| n.parse::<u32>().ok());
+        let code = match function_key {
+            Some(n @ 1..=24) => u32::from(VK_F1.0) + n - 1,
+            _ => {
+                let mut units = key.encode_utf16();
+                let (Some(unit), None) = (units.next(), units.next()) else {
+                    return None;
+                };
+                // The key that types this character; its code is the low byte.
+                let scan = unsafe { VkKeyScanW(unit) };
+                if scan == -1 {
+                    return None;
+                }
+                u32::from(scan as u16 & 0xFF)
+            }
+        };
+        // Holding the keys down opens the quick note once, not over and over.
+        let mut modifiers = MOD_NOREPEAT;
+        for (held, flag) in [
+            (combo.ctrl, MOD_CONTROL),
+            (combo.alt, MOD_ALT),
+            (combo.shift, MOD_SHIFT),
+            (combo.win, MOD_WIN),
+        ] {
+            if held {
+                modifiers |= flag;
+            }
+        }
+        Some((modifiers.0, code))
+    }
+
+    /// The icon's right-click menu, at the mouse pointer. Returns once an
+    /// entry was chosen or the menu was dismissed.
+    fn tray_menu(window: HWND) -> Option<TrayEvent> {
+        let chosen = unsafe {
+            let menu = CreatePopupMenu().ok()?;
+            for (id, text) in [
+                (MENU_SHOW_MAIN, "打开主面板"),
+                (MENU_QUICK_NOTE, "快速记事"),
+                (MENU_SETTINGS, "设置…"),
+            ] {
+                let text = wide(text);
+                let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(text.as_ptr()));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let quit = wide("退出便签");
+            let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, PCWSTR(quit.as_ptr()));
+            // Shown in bold: what a double click on such an icon usually does.
+            let _ = SetMenuDefaultItem(menu, MENU_SHOW_MAIN as u32, 0);
+
+            let mut cursor = POINT::default();
+            let _ = GetCursorPos(&mut cursor);
+            // A menu whose owner is not in the foreground stays open when the
+            // user clicks somewhere else. This also lets the UI thread bring
+            // its window forward afterwards.
+            let _ = SetForegroundWindow(window);
+            let chosen = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                cursor.x,
+                cursor.y,
+                None,
+                window,
+                None,
+            );
+            // Without a message to follow, the menu may not close properly
+            // the next time it is dismissed.
+            let _ = PostMessageW(Some(window), WM_NULL, WPARAM(0), LPARAM(0));
+            let _ = DestroyMenu(menu);
+            chosen.0 as usize
+        };
+        match chosen {
+            MENU_SHOW_MAIN => Some(TrayEvent::ShowMain),
+            MENU_QUICK_NOTE => Some(TrayEvent::QuickNote),
+            MENU_SETTINGS => Some(TrayEvent::OpenSettings),
+            MENU_QUIT => Some(TrayEvent::Quit),
+            _ => None,
+        }
+    }
+
     unsafe extern "system" fn control_proc(
         window: HWND,
         message: u32,
@@ -395,18 +614,39 @@ mod imp {
                 // Without NOTIFYICON_VERSION_4 the low word of lParam is the
                 // mouse message itself.
                 let event = match lparam.0 as u32 & 0xFFFF {
-                    WM_LBUTTONUP => Some(TrayEvent::QuickNote),
-                    WM_RBUTTONUP => Some(TrayEvent::ShowMain),
+                    WM_LBUTTONUP => {
+                        // The click entitles this process to the foreground
+                        // right now. Take it here so the UI thread, which
+                        // reacts a moment later, can bring its own window
+                        // forward.
+                        let _ = unsafe { SetForegroundWindow(window) };
+                        Some(TrayEvent::QuickNote)
+                    }
+                    WM_RBUTTONUP => tray_menu(window),
                     _ => None,
                 };
                 if let Some(event) = event {
-                    // The click entitles this process to the foreground right
-                    // now. Take it here so the UI thread, which reacts a
-                    // moment later, can bring its own window forward.
-                    let _ = unsafe { SetForegroundWindow(window) };
                     emit(event);
                 }
                 LRESULT(0)
+            }
+            WM_HOTKEY => {
+                if wparam.0 as i32 == HOTKEY_ID {
+                    // As with a click on the icon.
+                    let _ = unsafe { SetForegroundWindow(window) };
+                    emit(TrayEvent::QuickNote);
+                }
+                LRESULT(0)
+            }
+            MSG_SET_HOTKEY => {
+                let _ = unsafe { UnregisterHotKey(Some(window), HOTKEY_ID) };
+                let code = lparam.0 as u32;
+                let registered = code == 0
+                    || unsafe {
+                        let modifiers = HOT_KEY_MODIFIERS(wparam.0 as u32);
+                        RegisterHotKey(Some(window), HOTKEY_ID, modifiers, code).is_ok()
+                    };
+                LRESULT(registered as isize)
             }
             MSG_SHOW_MAIN => {
                 let _ = unsafe { SetForegroundWindow(window) };
@@ -426,6 +666,7 @@ mod imp {
                 LRESULT(0)
             }
             MSG_SHUTDOWN => {
+                let _ = unsafe { UnregisterHotKey(Some(window), HOTKEY_ID) };
                 remove_icon(window);
                 let _ = unsafe { DestroyWindow(window) };
                 LRESULT(0)
@@ -548,6 +789,7 @@ mod imp {
 mod stub {
     use super::TrayEvent;
     use futures::channel::mpsc::UnboundedReceiver;
+    use stickynotes_core::shortcuts::Combo;
 
     pub struct Tray;
 
@@ -558,11 +800,23 @@ mod stub {
         pub fn show_icon(&self) {}
         pub fn hide_icon(&self) {}
         pub fn show_hint(&self) {}
+        pub fn set_hotkey(&self, _combo: Option<&Combo>) -> Result<(), &'static str> {
+            Ok(())
+        }
         pub fn shutdown(&self) {}
     }
 
     pub fn claim_single_instance() -> bool {
         true
+    }
+    pub fn launched_at_login() -> bool {
+        false
+    }
+    pub fn autostart_enabled() -> bool {
+        false
+    }
+    pub fn set_autostart(_on: bool) -> Result<(), String> {
+        Err("这个系统上不支持开机自启动".into())
     }
     pub fn hwnd_of(_window: &gpui_kit::Window) -> Option<isize> {
         None
