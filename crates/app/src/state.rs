@@ -442,9 +442,9 @@ pub struct AppState {
     pub recording_shortcut: Option<&'static str>,
     /// Why the last recorded combination was refused, and for which action.
     pub shortcut_error: Option<(&'static str, String)>,
-    /// Why the system-wide quick-note key is not in effect although one is
-    /// set — typically another program holds the same keys.
-    pub hotkey_problem: Option<&'static str>,
+    /// Why a system-wide key is not in effect although one is set — usually
+    /// another program holds the same keys. Keyed by action id.
+    pub hotkey_problems: HashMap<&'static str, &'static str>,
 
     // Notification area and quick note
     /// `None` when there is no notification-area icon to come back from:
@@ -574,7 +574,7 @@ impl AppState {
             keymap,
             recording_shortcut: None,
             shortcut_error: None,
-            hotkey_problem: None,
+            hotkey_problems: HashMap::new(),
             tray: None,
             main_hwnd: win::hwnd_of(window),
             awaiting_first_show: hidden,

@@ -329,7 +329,7 @@ impl AppState {
     }
 
     /// 打开主面板: continue with this note in the main panel.
-    fn quick_open_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn quick_open_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.quick_flush(window, cx) {
             return;
         }

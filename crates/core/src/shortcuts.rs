@@ -38,6 +38,7 @@ const fn action(
 }
 
 pub const QUICK_NOTE: &str = "quick_note";
+pub const OPEN_MAIN: &str = "open_main";
 pub const NEW_TAG: &str = "new_tag";
 pub const SEARCH: &str = "search";
 pub const MD_PARAGRAPH: &str = "md_paragraph";
@@ -65,6 +66,7 @@ pub const MD_TABLE: &str = "md_table";
 /// `Ctrl+Shift+0` never arrives at all.
 pub const ACTIONS: &[ActionDef] = &[
     action(QUICK_NOTE, "快速记事", Group::Global, "Ctrl+Alt+Q"),
+    action(OPEN_MAIN, "打开主面板", Group::Global, "Ctrl+Alt+S"),
     action(NEW_TAG, "新建标签", Group::General, "Ctrl+Shift+N"),
     action(SEARCH, "搜索便签", Group::General, "Ctrl+F"),
     action(MD_PARAGRAPH, "正文", Group::Markdown, "Ctrl+Alt+0"),
@@ -546,18 +548,27 @@ mod tests {
     }
 
     #[test]
-    fn the_system_wide_quick_note_key_is_one_of_the_shortcuts() {
+    fn the_system_wide_keys_are_shortcuts_of_their_own() {
         let quick = action_def(QUICK_NOTE).unwrap();
         assert_eq!(quick.group, Group::Global);
-        assert_eq!(ACTIONS.iter().filter(|a| a.group == Group::Global).count(), 1);
         assert_eq!(Keymap::default().label(QUICK_NOTE).as_deref(), Some("Ctrl+Alt+Q"));
 
-        // Its key presses never reach the window, so no other action may
+        // Windows registers every global action as a key of its own.
+        let main = action_def(OPEN_MAIN).unwrap();
+        assert_eq!(main.group, Group::Global);
+        assert_eq!(ACTIONS.iter().filter(|a| a.group == Group::Global).count(), 2);
+        assert_eq!(Keymap::default().label(OPEN_MAIN).as_deref(), Some("Ctrl+Alt+S"));
+
+        // Their key presses never reach the window, so no other action may
         // share them — until it has been moved or switched off.
         let mut stored = BTreeMap::new();
         assert_eq!(
             assign(&mut stored, SEARCH, Some(&combo("Ctrl+Alt+Q"))),
             Err(AssignError::Taken(quick))
+        );
+        assert_eq!(
+            assign(&mut stored, SEARCH, Some(&combo("Ctrl+Alt+S"))),
+            Err(AssignError::Taken(main))
         );
         assign(&mut stored, QUICK_NOTE, Some(&combo("Ctrl+Alt+J"))).unwrap();
         assign(&mut stored, SEARCH, Some(&combo("Ctrl+Alt+Q"))).unwrap();
@@ -567,6 +578,12 @@ mod tests {
 
         assign(&mut stored, QUICK_NOTE, None).unwrap();
         assert_eq!(Keymap::resolve(&stored).combo(QUICK_NOTE), None);
+
+        // The two global keys are separate: changing one leaves the other.
+        assign(&mut stored, OPEN_MAIN, Some(&combo("Ctrl+Alt+M"))).unwrap();
+        let keymap = Keymap::resolve(&stored);
+        assert_eq!(keymap.action_for(&combo("Ctrl+Alt+M")).map(|a| a.id), Some(OPEN_MAIN));
+        assert_eq!(keymap.action_for(&combo("Ctrl+Alt+S")), None);
 
         // Keys someone already gave to another action stay with it: the
         // quick note then simply has none until it is given some.

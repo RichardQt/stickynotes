@@ -1740,7 +1740,10 @@ impl AppState {
             // The system-wide key is set, but Windows would not register it.
             .or_else(|| {
                 let global = def.group == Group::Global && !recording;
-                self.hotkey_problem.filter(|_| global).map(str::to_string)
+                self.hotkey_problems
+                    .get(action)
+                    .filter(|_| global)
+                    .map(|message| (*message).to_string())
             });
 
         let key_content: AnyElement = if recording {

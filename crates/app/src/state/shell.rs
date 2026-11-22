@@ -6,6 +6,7 @@ use super::AppState;
 use crate::win::{self, TrayEvent};
 use futures::StreamExt as _;
 use gpui_kit::*;
+use std::collections::HashMap;
 use stickynotes_core::config::CloseBehavior;
 use stickynotes_core::shortcuts;
 
@@ -90,6 +91,7 @@ impl AppState {
         match event {
             TrayEvent::QuickNote => self.open_quick_note(window, cx),
             TrayEvent::ShowMain => self.show_main(window, cx),
+            TrayEvent::OpenMain => self.open_main_panel(window, cx),
             TrayEvent::OpenSettings => {
                 self.show_main(window, cx);
                 // Not over another dialog, and not a second time: opening
@@ -105,19 +107,39 @@ impl AppState {
         }
     }
 
-    /// Hand the quick-note key to Windows, which then reports it from any
-    /// program. While a shortcut is being recorded there is no such key:
-    /// every key press has to reach the settings page instead.
-    pub(super) fn apply_global_hotkey(&mut self) {
-        let Some(tray) = &self.tray else {
-            return;
-        };
-        if self.recording_shortcut.is_some() {
-            let _ = tray.set_hotkey(None);
+    /// The system-wide "open main panel" key: a quick note being written is
+    /// saved and continued in the main panel; otherwise the panel is simply
+    /// brought to the front.
+    pub(super) fn open_main_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick.is_some() {
+            self.quick_open_main(window, cx);
         } else {
-            let combo = self.keymap.combo(shortcuts::QUICK_NOTE);
-            self.hotkey_problem = tray.set_hotkey(combo).err();
+            self.show_main(window, cx);
         }
+    }
+
+    /// Hand the system-wide keys to Windows, which then report them from any
+    /// program. While a shortcut is being recorded there are none: every key
+    /// press has to reach the settings page instead.
+    pub(super) fn apply_global_hotkey(&mut self) {
+        let mut problems = HashMap::new();
+        if let Some(tray) = &self.tray {
+            let recording = self.recording_shortcut.is_some();
+            for (key, action) in [
+                (win::GlobalKey::QuickNote, shortcuts::QUICK_NOTE),
+                (win::GlobalKey::MainPanel, shortcuts::OPEN_MAIN),
+            ] {
+                let combo = if recording {
+                    None
+                } else {
+                    self.keymap.combo(action)
+                };
+                if let Err(problem) = tray.set_hotkey(key, combo) {
+                    problems.insert(action, problem);
+                }
+            }
+        }
+        self.hotkey_problems = problems;
     }
 
     /// The main window was asked to close (title-bar button, Alt+F4, the

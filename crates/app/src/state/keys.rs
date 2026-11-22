@@ -149,7 +149,11 @@ impl AppState {
             // They only arrive here when it could not be given them.
             Group::Global => {
                 cx.stop_propagation();
-                self.open_quick_note(window, cx);
+                if action.id == shortcuts::OPEN_MAIN {
+                    self.open_main_panel(window, cx);
+                } else {
+                    self.open_quick_note(window, cx);
+                }
             }
             Group::General => {
                 cx.stop_propagation();

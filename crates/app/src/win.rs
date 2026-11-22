@@ -1,6 +1,6 @@
 //! Win32 pieces the UI toolkit does not cover: the notification-area icon
-//! and its menu, the system-wide quick-note key, the single-instance guard,
-//! starting with Windows, and hiding / showing / placing top-level windows.
+//! and its menu, the system-wide keys, the single-instance guard, starting
+//! with Windows, and hiding / showing / placing top-level windows.
 //!
 //! Window handles travel as plain `isize` values so they can cross threads
 //! and sit in the app state.
@@ -14,10 +14,23 @@ pub enum TrayEvent {
     /// The menu — or the app was started a second time: show the main
     /// window.
     ShowMain,
+    /// The system-wide shortcut: open the main panel, continuing a quick
+    /// note in it when one is being written.
+    OpenMain,
     /// The menu: show the main window with the settings open.
     OpenSettings,
     /// The menu: quit the app.
     Quit,
+}
+
+/// The system-wide keys the control window holds. Each is registered with
+/// Windows on its own, so either can fail while the other works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalKey {
+    /// Open the quick note from any program.
+    QuickNote,
+    /// Open the main panel from any program.
+    MainPanel,
 }
 
 #[cfg(windows)]
@@ -27,7 +40,7 @@ pub use stub::*;
 
 #[cfg(windows)]
 mod imp {
-    use super::TrayEvent;
+    use super::{GlobalKey, TrayEvent};
     use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
     use std::cell::{Cell, RefCell};
     use std::ffi::c_void;
@@ -79,8 +92,10 @@ mod imp {
     /// Posted by a second instance of the app before it exits.
     const MSG_SHOW_MAIN: u32 = WM_APP + 5;
     const MSG_SHUTDOWN: u32 = WM_APP + 6;
-    /// Register the system-wide key in wParam (modifiers) and lParam (key
-    /// code, 0 for none) in place of the current one. Answers 1 when done.
+    /// Register the system-wide key named in wParam (a [`GlobalKey`] as
+    /// `usize`) in place of the current one. lParam packs the modifier flags
+    /// in its high half and the key code in its low half; key code 0 means
+    /// "no key". Answers 1 when done.
     const MSG_SET_HOTKEY: u32 = WM_APP + 7;
 
     const TRAY_ICON_ID: u32 = 1;
@@ -95,8 +110,20 @@ mod imp {
     const MENU_SETTINGS: usize = 3;
     const MENU_QUIT: usize = 4;
 
-    /// The one system-wide key of the control window.
-    const HOTKEY_ID: i32 = 1;
+    /// Ids under which the control window holds its system-wide keys.
+    const HOTKEY_QUICK_NOTE: i32 = 1;
+    const HOTKEY_OPEN_MAIN: i32 = 2;
+
+    fn hotkey_id(key: GlobalKey) -> i32 {
+        match key {
+            GlobalKey::QuickNote => HOTKEY_QUICK_NOTE,
+            GlobalKey::MainPanel => HOTKEY_OPEN_MAIN,
+        }
+    }
+
+    fn is_hotkey_id(id: i32) -> bool {
+        id == HOTKEY_QUICK_NOTE || id == HOTKEY_OPEN_MAIN
+    }
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
@@ -296,10 +323,10 @@ mod imp {
             self.post(MSG_HINT);
         }
 
-        /// Make `combo` open the quick note from any program, in place of
-        /// the key that did so far; `None` leaves no such key. The error is
-        /// ready to be shown.
-        pub fn set_hotkey(&self, combo: Option<&Combo>) -> Result<(), &'static str> {
+        /// Make `combo` open what `key` stands for from any program, in
+        /// place of the key that did so far; `None` leaves no such key. The
+        /// error is ready to be shown.
+        pub fn set_hotkey(&self, key: GlobalKey, combo: Option<&Combo>) -> Result<(), &'static str> {
             if self.closed.get() {
                 return Ok(());
             }
@@ -316,8 +343,9 @@ mod imp {
                 SendMessageTimeoutW(
                     hwnd(self.control),
                     MSG_SET_HOTKEY,
-                    WPARAM(modifiers as usize),
-                    LPARAM(code as isize),
+                    WPARAM(hotkey_id(key) as usize),
+                    // Key codes and modifier flags both fit in 16 bits.
+                    LPARAM((code | (modifiers << 16)) as isize),
                     SMTO_ABORTIFHUNG,
                     1500,
                     Some(&mut registered),
@@ -631,20 +659,29 @@ mod imp {
                 LRESULT(0)
             }
             WM_HOTKEY => {
-                if wparam.0 as i32 == HOTKEY_ID {
-                    // As with a click on the icon.
-                    let _ = unsafe { SetForegroundWindow(window) };
-                    emit(TrayEvent::QuickNote);
+                // Both keys take the foreground right so the window the UI
+                // thread is about to open may come to the front.
+                let _ = unsafe { SetForegroundWindow(window) };
+                match wparam.0 as i32 {
+                    HOTKEY_QUICK_NOTE => emit(TrayEvent::QuickNote),
+                    HOTKEY_OPEN_MAIN => emit(TrayEvent::OpenMain),
+                    _ => {}
                 }
                 LRESULT(0)
             }
             MSG_SET_HOTKEY => {
-                let _ = unsafe { UnregisterHotKey(Some(window), HOTKEY_ID) };
-                let code = lparam.0 as u32;
+                let id = wparam.0 as i32;
+                if !is_hotkey_id(id) {
+                    return LRESULT(0);
+                }
+                let packed = lparam.0 as u32;
+                let code = packed & 0xFFFF;
+                let modifiers = packed >> 16;
+                let _ = unsafe { UnregisterHotKey(Some(window), id) };
                 let registered = code == 0
                     || unsafe {
-                        let modifiers = HOT_KEY_MODIFIERS(wparam.0 as u32);
-                        RegisterHotKey(Some(window), HOTKEY_ID, modifiers, code).is_ok()
+                        let modifiers = HOT_KEY_MODIFIERS(modifiers);
+                        RegisterHotKey(Some(window), id, modifiers, code).is_ok()
                     };
                 LRESULT(registered as isize)
             }
@@ -666,7 +703,8 @@ mod imp {
                 LRESULT(0)
             }
             MSG_SHUTDOWN => {
-                let _ = unsafe { UnregisterHotKey(Some(window), HOTKEY_ID) };
+                let _ = unsafe { UnregisterHotKey(Some(window), HOTKEY_QUICK_NOTE) };
+                let _ = unsafe { UnregisterHotKey(Some(window), HOTKEY_OPEN_MAIN) };
                 remove_icon(window);
                 let _ = unsafe { DestroyWindow(window) };
                 LRESULT(0)
@@ -787,7 +825,7 @@ mod imp {
 /// window always quits and the quick-note window is never asked for.
 #[cfg(not(windows))]
 mod stub {
-    use super::TrayEvent;
+    use super::{GlobalKey, TrayEvent};
     use futures::channel::mpsc::UnboundedReceiver;
     use stickynotes_core::shortcuts::Combo;
 
@@ -800,7 +838,11 @@ mod stub {
         pub fn show_icon(&self) {}
         pub fn hide_icon(&self) {}
         pub fn show_hint(&self) {}
-        pub fn set_hotkey(&self, _combo: Option<&Combo>) -> Result<(), &'static str> {
+        pub fn set_hotkey(
+            &self,
+            _key: GlobalKey,
+            _combo: Option<&Combo>,
+        ) -> Result<(), &'static str> {
             Ok(())
         }
         pub fn shutdown(&self) {}
