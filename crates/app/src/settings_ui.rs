@@ -29,6 +29,9 @@ use stickynotes_core::shortcuts::{self, ActionDef, Combo, Group};
 
 /// Accent of the settings dialog: switches, selected items, links.
 const ACCENT: u32 = 0x3B6EA8;
+/// Opacity of a setting that currently has no effect (its switch is off):
+/// still legible, clearly stepped back from the live rows around it.
+const DISABLED_ALPHA: f32 = 0.42;
 /// The red of destructive actions and of refused input.
 const DANGER: u32 = 0xE5484D;
 const DANGER_HOVER: u32 = 0xDC3E42;
@@ -1040,19 +1043,33 @@ impl AppState {
     /// test/sync actions unified inside one snow-porcelain card.
     fn render_sync_group(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let in_effect = config::format_sync_delay_secs(self.config.sync_delay_ms);
-        let refused = self.delay_error;
         let interval_secs = config::clamp_pull_interval_secs(self.config.pull_interval_secs);
+        // The pull interval and the upload delay only shape automatic sync.
+        // While it is off they stay readable but step back and cannot be
+        // changed, so the switch reads as the thing that governs them.
+        let auto_on = self.config.webdav_auto;
+        let params_alpha = transition(
+            "sync-params-alpha",
+            if auto_on { 1.0_f32 } else { DISABLED_ALPHA },
+            Transition::new(Duration::from_millis(180)).ease(ease_out_cubic),
+            window,
+            cx,
+        );
+        // A refused delay is only worth a red line while the field is live.
+        let refused = self.delay_error.filter(|_| auto_on);
 
         let mut delay_row = h_flex()
             .justify_between()
             .items_center()
             .gap_3()
+            .opacity(params_alpha)
             .child(setting_text(
                 "编辑后上传延迟",
                 "停止编辑后等待这么久再上传。范围 0.5 – 600 秒，可带一位小数，默认 2.5 秒。",
             ));
         if let Some(inputs) = &self.settings {
-            let delay_focused = inputs.delay.read(cx).focus_handle(cx).is_focused(window);
+            let delay_focused =
+                auto_on && inputs.delay.read(cx).focus_handle(cx).is_focused(window);
             delay_row = delay_row.child(
                 h_flex()
                     .flex_none()
@@ -1087,7 +1104,8 @@ impl AppState {
                                     Input::new(&inputs.delay)
                                         .appearance(false)
                                         .bordered(false)
-                                        .focus_bordered(false),
+                                        .focus_bordered(false)
+                                        .disabled(!auto_on),
                                 ),
                             ),
                     )
@@ -1121,14 +1139,14 @@ impl AppState {
                             window,
                             cx,
                         )
-                        .on_click(cx.listener(|this, _, _window, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
                             let on = !this.config.webdav_auto;
-                            this.set_webdav_auto(on, cx);
+                            this.set_webdav_auto(on, window, cx);
                         })),
                     ),
             )
             .child(row_divider())
-            .child(self.render_pull_interval_row(interval_secs, window, cx))
+            .child(self.render_pull_interval_row(interval_secs, auto_on, params_alpha, window, cx))
             .child(row_divider())
             .child(
                 v_flex()
@@ -1146,13 +1164,17 @@ impl AppState {
     }
 
     /// "检查其他设备更新": how often the background loop looks at the server.
+    /// `enabled` is false while automatic sync is off: the row is drawn at
+    /// `alpha` and its dropdown no longer opens.
     fn render_pull_interval_row(
         &self,
         interval_secs: u64,
+        enabled: bool,
+        alpha: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let open = self.settings_menu == Some(SettingsMenu::PullInterval);
+        let open = enabled && self.settings_menu == Some(SettingsMenu::PullInterval);
         let chevron_rot = spring(
             "pull-chevron-rot",
             if open { 0.5_f32 } else { 0.0_f32 },
@@ -1257,18 +1279,20 @@ impl AppState {
                     } else {
                         ios_field_shadow()
                     })
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0xFAFBFD)))
-                    .active(|s| s.bg(rgb(0xECEEF4)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.cancel_shortcut_recording(cx);
-                        this.settings_menu = match this.settings_menu {
-                            Some(SettingsMenu::PullInterval) => None,
-                            _ => Some(SettingsMenu::PullInterval),
-                        };
-                        cx.notify();
-                    }))
+                    .when(enabled, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(rgb(0xFAFBFD)))
+                            .active(|s| s.bg(rgb(0xECEEF4)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.cancel_shortcut_recording(cx);
+                                this.settings_menu = match this.settings_menu {
+                                    Some(SettingsMenu::PullInterval) => None,
+                                    _ => Some(SettingsMenu::PullInterval),
+                                };
+                                cx.notify();
+                            }))
+                    })
                     .child(
                         Label::new(config::format_pull_interval(interval_secs))
                             .text_size(px(12.))
@@ -1292,6 +1316,7 @@ impl AppState {
             .justify_between()
             .items_center()
             .gap_3()
+            .opacity(alpha)
             .child(setting_text(
                 "检查其他设备更新",
                 "后台每隔多久查看服务器；启动、切回窗口时立即检查，藏在托盘时至少 10 分钟。",

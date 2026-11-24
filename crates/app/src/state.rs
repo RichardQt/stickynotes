@@ -1764,7 +1764,7 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn set_webdav_auto(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub fn set_webdav_auto(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.config.webdav_auto = on;
         let _ = self.config.save();
         if on {
@@ -1772,6 +1772,19 @@ impl AppState {
             self.webdav_failures = 0;
             self.webdav_failed = false;
             self.webdav_next_try = Instant::now();
+        } else {
+            // The interval and the delay are greyed out now: neither may be
+            // left half-open underneath, an open list or a caret in the field.
+            if self.settings_menu == Some(SettingsMenu::PullInterval) {
+                self.settings_menu = None;
+            }
+            let delay_focused = self
+                .settings
+                .as_ref()
+                .is_some_and(|s| s.delay.read(cx).focus_handle(cx).is_focused(window));
+            if delay_focused {
+                window.focus(&self.modal_focus, cx);
+            }
         }
         cx.notify();
     }
