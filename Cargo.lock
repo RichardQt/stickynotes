@@ -6840,7 +6840,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stickynotes-app"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -6857,7 +6857,7 @@ dependencies = [
 
 [[package]]
 name = "stickynotes-core"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "reqwest",

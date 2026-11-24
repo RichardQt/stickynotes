@@ -1106,12 +1106,12 @@ impl AppState {
                     .justify_between()
                     .items_center()
                     .gap_3()
+                    // Only what the switch itself decides. When and how often
+                    // sync runs is the business of the two rows below it;
+                    // repeating their values here made them read as duplicates.
                     .child(setting_text(
                         "自动同步（WebDAV）",
-                        format!(
-                            "启动时、编辑后约 {in_effect} 秒上传；每 {} 检查其他设备的更新，回到窗口时立即检查",
-                            config::format_pull_interval(interval_secs)
-                        ),
+                        "开启后自动上传本机的修改、下载其他设备的改动；关闭后只在点「立即同步」时同步。",
                     ))
                     .child(
                         settings_switch(
@@ -1294,7 +1294,7 @@ impl AppState {
             .gap_3()
             .child(setting_text(
                 "检查其他设备更新",
-                "后台按此间隔查看服务器上其他设备的改动；窗口藏在托盘时放慢到至少 10 分钟。本机编辑后的上传不受这个间隔影响。",
+                "后台每隔多久查看服务器；启动、切回窗口时立即检查，藏在托盘时至少 10 分钟。",
             ))
             .child(dropdown)
     }
