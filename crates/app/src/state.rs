@@ -143,6 +143,22 @@ impl SyncPass {
     }
 }
 
+/// How long the sidebar keeps saying "同步完成" after a pass.
+const WEBDAV_FLASH: Duration = Duration::from_secs(4);
+
+/// What the sidebar says for a few seconds after a pass finishes. A pass the
+/// user asked for always confirms; a quiet poll only speaks when it actually
+/// changed something, so the corner does not flash every few minutes.
+fn sync_flash(quiet: bool, changed: usize) -> Option<String> {
+    if changed > 0 {
+        Some(format!("同步完成 · {changed} 项更新"))
+    } else if quiet {
+        None
+    } else {
+        Some("同步完成".into())
+    }
+}
+
 /// Which drop-down list of the settings dialog is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsMenu {
@@ -373,6 +389,9 @@ pub struct AppState {
     pub webdav_test: WebDavTest,
     pub webdav_syncing: bool,
     pub webdav_message: Option<String>,
+    /// "同步完成 · N 项更新" to show in the sidebar footer for a few seconds;
+    /// the instant beside it is when it stops being shown.
+    pub webdav_flash: Option<(String, Instant)>,
     /// Bumped on every edit so only the last debounced WebDAV push runs.
     webdav_epoch: u64,
     /// Remote file versions from the last pass. Lets a pull skip unchanged
@@ -569,6 +588,7 @@ impl AppState {
             webdav_test: WebDavTest::Idle,
             webdav_syncing: false,
             webdav_message: None,
+            webdav_flash: None,
             webdav_epoch: 0,
             webdav_cache: webdav::SyncCache::load(),
             webdav_deletions: webdav::DeleteLedger::load(),
@@ -2251,6 +2271,8 @@ impl AppState {
         self.webdav_pending = false;
         self.webdav_pending_force = false;
         self.webdav_last_pass = Some(Instant::now());
+        // A new pass replaces whatever the last one had to say.
+        self.webdav_flash = None;
         if !pass.quiet() {
             self.webdav_message = Some("正在同步…".into());
         }
@@ -2378,6 +2400,7 @@ impl AppState {
             self.webdav_pending = false;
             self.webdav_pending_force = false;
             self.webdav_message = None;
+            self.webdav_flash = None;
             self.schedule_webdav_sync(window, cx);
             cx.notify();
             return;
@@ -2488,22 +2511,46 @@ impl AppState {
                     self.refresh_after_remote(window, cx);
                 }
                 let summary = report.summary();
-                let touched = report.uploaded
+                let changed_items = report.uploaded
                     + report.downloaded
                     + report.deleted_remote
-                    + report.deleted_local.len()
-                    > 0;
+                    + report.deleted_local.len();
+                let touched = changed_items > 0;
                 // A quiet pass that found nothing to do says nothing: the
                 // status line belongs to what the user did, not to the poll.
                 if !quiet || touched || write_error.is_some() {
                     self.webdav_message = Some(summary.clone());
                 }
+                let write_failed = write_error.is_some();
                 if let Some(e) = write_error {
                     self.status = SyncStatus::Error(e);
                 } else if !quiet || touched {
                     self.status = SyncStatus::Saved(summary);
                 }
                 self.webdav_failed = false;
+                // The footer confirms the pass for a few seconds, so the user
+                // does not have to catch the spinner while it runs.
+                if write_failed {
+                    self.webdav_flash = None;
+                } else if let Some(text) = sync_flash(quiet, changed_items) {
+                    self.webdav_flash = Some((text, Instant::now() + WEBDAV_FLASH));
+                    let this = cx.weak_entity();
+                    window
+                        .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                            cx.background_executor().timer(WEBDAV_FLASH).await;
+                            let _ = this.update_in(cx, |this, _window, cx| {
+                                if this
+                                    .webdav_flash
+                                    .as_ref()
+                                    .is_some_and(|(_, until)| *until <= Instant::now())
+                                {
+                                    this.webdav_flash = None;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                }
             }
             Err(e) => {
                 self.webdav_failures = self.webdav_failures.saturating_add(1);
@@ -2528,6 +2575,7 @@ impl AppState {
                     self.webdav_message = Some(format!("同步失败：{e}"));
                 }
                 self.webdav_failed = true;
+                self.webdav_flash = None;
             }
         }
         if self.webdav_pending {

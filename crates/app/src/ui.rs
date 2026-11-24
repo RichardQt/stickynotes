@@ -1349,21 +1349,32 @@ impl AppState {
 
         let webdav_configured = self.config.webdav_configured();
         let webdav_on = self.config.webdav_auto && webdav_configured;
-        // Only a pass the user caused shows itself; a background pull that
-        // finds nothing to do must not flash "正在同步…".
-        let webdav_working = self.webdav_syncing && !self.webdav_quiet;
+        // A pass in flight always shows itself: the spinner is the promise
+        // that something is happening. A background poll says "checking", so
+        // it is not mistaken for a full sync.
+        let webdav_working = self.webdav_syncing;
+        let webdav_flash = self
+            .webdav_flash
+            .as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(text, _)| text.as_str());
         let (dot_hex, webdav_label) = if webdav_working {
-            (0x4F86C6, "WebDAV 正在同步…")
+            (
+                0x4F86C6,
+                if self.webdav_quiet { "正在检查更新…" } else { "正在同步…" },
+            )
         } else if self.webdav_failed && webdav_on {
             // Said until a pass succeeds: a down server is not retried on
             // every window switch, so the dot is where it stays visible.
             (0xD2615C, "WebDAV 同步失败")
+        } else if let Some(text) = webdav_flash {
+            (0x52A876, text)
         } else if webdav_on {
-            (0x52A876, "WebDAV 自动同步")
+            (0x52A876, "自动同步已开启")
         } else if webdav_configured {
-            (0xD49B3E, "WebDAV 已配置")
+            (0xD49B3E, "自动同步已关闭")
         } else {
-            (0xAAB3C0, "WebDAV 未配置")
+            (0xAAB3C0, "本地存储")
         };
         let dot_color = transition(
             "sidebar-webdav-dot",
@@ -1375,24 +1386,44 @@ impl AppState {
         )
         .0;
 
-        let status_dot: AnyElement = {
-            let base = div()
-                .size(px(6.5))
-                .flex_none()
-                .rounded_full()
-                .bg(dot_color);
-            if webdav_working && !reduce_motion {
-                base.with_animation(
-                    "sidebar-webdav-pulse",
-                    Animation::new(Duration::from_millis(1300))
-                        .repeat()
-                        .with_easing(pulsating_between(0.38, 1.0)),
-                    |el, alpha| el.opacity(alpha),
+        // One 11px slot for every state, so the label never shifts sideways
+        // when the dot turns into a spinner or a check.
+        let status_lead: AnyElement = {
+            let lead: AnyElement = if webdav_working {
+                spinning_icon(
+                    "sidebar-webdav-spin",
+                    AssetIconName::RefreshCw,
+                    px(10.5),
+                    rgb(0x4F86C6),
+                    reduce_motion,
                 )
-                .into_any_element()
+            } else if webdav_flash.is_some() && !self.webdav_failed {
+                Icon::new(AssetIconName::CircleCheck)
+                    .size(px(10.5))
+                    .flex_none()
+                    .text_color(rgb(0x2A8555))
+                    .into_any_element()
+            } else if !webdav_configured {
+                Icon::new(AssetIconName::HardDrive)
+                    .size(px(10.5))
+                    .flex_none()
+                    .text_color(rgb(INK_MUTED))
+                    .into_any_element()
             } else {
-                base.into_any_element()
-            }
+                div()
+                    .size(px(6.5))
+                    .rounded_full()
+                    .bg(dot_color)
+                    .into_any_element()
+            };
+            div()
+                .size(px(11.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(lead)
+                .into_any_element()
         };
 
         let gear_rot = spring(
@@ -1405,40 +1436,54 @@ impl AppState {
             cx,
         );
 
-        // A local-first app should not carry a permanent "not configured"
-        // line. Without a WebDAV account the footer is just the gear; once
-        // there is one, the line says what sync is doing. It is a status,
-        // not a control: settings live behind the gear next to it.
-        let status_group: AnyElement = if webdav_configured {
-            h_flex()
-                .items_center()
-                .gap_2()
-                .min_w_0()
-                .px_1p5()
-                .py(px(3.))
-                .child(status_dot)
-                .child(if self.webdav_failed && webdav_on && !webdav_working {
-                    // The failure is the thing to read here, not a muted
-                    // footnote: it stays until sync recovers.
-                    div()
-                        .id("webdav-failed-label")
-                        .min_w_0()
-                        .child(
-                            Label::new(webdav_label)
-                                .text_size(px(11.5))
-                                .text_color(rgb(0xB45B67)),
-                        )
-                        .into_any_element()
+        // The footer always says where the notes live: "本地存储" without a
+        // WebDAV account, then the sync state once there is one. It is a
+        // status, not a control: settings live behind the gear next to it.
+        let status_group: AnyElement = h_flex()
+            .flex_1()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .px_1p5()
+            .py(px(3.))
+            .child(status_lead)
+            .child(if self.webdav_failed && webdav_on && !webdav_working {
+                // The failure is the thing to read here, not a muted
+                // footnote: it stays until sync recovers.
+                div()
+                    .id("webdav-failed-label")
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(webdav_label)
+                            .text_size(px(11.5))
+                            .text_color(rgb(0xB45B67))
+                            .whitespace_nowrap()
+                            .text_ellipsis(),
+                    )
+                    .into_any_element()
+            } else {
+                let label_color = if webdav_working {
+                    rgb(0x3B6EA8)
+                } else if webdav_flash.is_some() {
+                    rgb(0x2A8555)
                 } else {
-                    Label::new(webdav_label)
-                        .text_size(px(11.5))
-                        .text_color(rgb(INK_SECONDARY))
-                        .into_any_element()
-                })
-                .into_any_element()
-        } else {
-            div().flex_1().into_any_element()
-        };
+                    rgb(INK_SECONDARY)
+                };
+                div()
+                    .id("webdav-state-label")
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(webdav_label)
+                            .text_size(px(11.5))
+                            .text_color(label_color)
+                            .whitespace_nowrap()
+                            .text_ellipsis(),
+                    )
+                    .into_any_element()
+            })
+            .into_any_element();
 
         let footer_status = div()
             .px_2p5()
