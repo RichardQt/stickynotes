@@ -98,13 +98,77 @@ fn parse_md_link(chars: &[char], start_bracket: usize) -> Option<(String, usize)
     None
 }
 
+/// One Markdown table row as a line a card can show: `| a | b |` becomes
+/// `a · b`. `None` for the `|---|---|` separator, which carries no content.
+fn table_row_preview(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    debug_assert!(trimmed.starts_with('|'));
+    if trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t')) {
+        return None;
+    }
+    let cells: Vec<String> = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .map(strip_markdown_syntax)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    (!cells.is_empty()).then(|| cells.join(" · "))
+}
+
+/// Rewrite table rows outside fenced code blocks into plain preview lines.
+/// `keep_fences` keeps the ``` markers for the preview parser (which drops
+/// them and treats their content as code); search drops them entirely, so a
+/// match window never shows a stray language name.
+fn preview_lines(markdown: &str, keep_fences: bool) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut in_fence = false;
+    for line in markdown.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            if keep_fences {
+                out.push_str(line);
+            }
+            out.push('\n');
+            continue;
+        }
+        if !in_fence && trimmed.starts_with('|') {
+            if let Some(row) = table_row_preview(line) {
+                out.push_str(&row);
+            }
+            // A separator row leaves no text behind; dropping the line (even
+            // as an empty one) keeps the paragraphs around it apart.
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn markdown_for_preview(markdown: &str) -> String {
+    preview_lines(markdown, true)
+}
+
+/// A note's Markdown as the one continuous text search matches in: table rows
+/// read as their preview form and fence markers are gone (their content
+/// stays). Matches can then be shown as clean previews instead of raw pipes
+/// and ``` markers.
+pub fn search_text(markdown: &str) -> String {
+    preview_lines(markdown, false)
+}
+
 /// Extract a display title and a brief content preview snippet from a note's
 /// Markdown. The first non-empty paragraph is the title.
 pub fn title_and_snippet(markdown: &str) -> (String, String) {
     // Paragraph splitting, fence handling and inline emphasis all come from
     // the markup parser, so a note previews the same whether it was written
     // here or imported from Windows Sticky Notes.
-    let paras = crate::markup::markdown_to_ir(markdown);
+    let preview_md = markdown_for_preview(markdown);
+    let paras = crate::markup::markdown_to_ir(&preview_md);
     let mut title = None;
     let mut snippet_parts: Vec<String> = Vec::new();
 
@@ -140,6 +204,31 @@ pub fn title_and_snippet(markdown: &str) -> (String, String) {
     (title_str, snippet_str)
 }
 
+/// A short one-line window around the first match of `query` (already
+/// lowercased) in `lower`, sliced from `source` so the original casing is
+/// kept. Search uses it to show why a note matched when the match sits deep
+/// in the body and the normal snippet would not mention it.
+pub fn snippet_around_match(source: &str, lower: &str, query: &str) -> Option<String> {
+    let pos = lower.find(query)?;
+    let match_start = lower[..pos].chars().count();
+    let match_len = query.chars().count();
+    let chars: Vec<char> = source.chars().collect();
+    let start = match_start.saturating_sub(24);
+    let end = (match_start + match_len + 56).min(chars.len());
+    let window: String = chars[start..end].iter().collect();
+    let mut text = strip_markdown_syntax(&window);
+    if text.is_empty() {
+        return None;
+    }
+    if start > 0 {
+        text.insert(0, '…');
+    }
+    if end < chars.len() {
+        text.push('…');
+    }
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +259,53 @@ mod tests {
         let (title, snippet) = title_and_snippet("标题\n```rust\nlet x = 1;\n```");
         assert_eq!(title, "标题");
         assert_eq!(snippet, "let x = 1;");
+    }
+
+    #[test]
+    fn table_rows_read_as_text_in_the_preview() {
+        let md = "WebDAV 备忘\n\n| 状态码 | 含义 | 处理 |\n| --- | :---: | --- |\n| 401 | 未授权 | 检查密码 |\n| 404 | 不存在 | 创建目录 |";
+        let (title, snippet) = title_and_snippet(md);
+        assert_eq!(title, "WebDAV 备忘");
+        assert_eq!(
+            snippet,
+            "状态码 · 含义 · 处理 401 · 未授权 · 检查密码 404 · 不存在 · 创建目录"
+        );
+        assert!(!snippet.contains('|'));
+        assert!(!snippet.contains("---"));
+    }
+
+    #[test]
+    fn a_pipe_inside_a_fence_is_not_a_table() {
+        let (title, snippet) = title_and_snippet("标题\n```sh\ncat a | grep b\n```");
+        assert_eq!(title, "标题");
+        assert_eq!(snippet, "cat a | grep b");
+    }
+
+    #[test]
+    fn search_text_flattens_tables_and_drops_fence_markers() {
+        let md = "标题\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n```rust\nfn x() {}\n```";
+        let text = search_text(md);
+        assert!(!text.contains('|'), "got: {text}");
+        assert!(!text.contains("```"), "got: {text}");
+        assert!(text.contains("a · b"), "got: {text}");
+        assert!(text.contains("fn x() {}"), "got: {text}");
+    }
+
+    #[test]
+    fn a_match_deep_in_the_body_gets_a_window_that_keeps_its_case() {
+        let md = "Title\n\nThese are enough leading words before the **Quick** brown fox jumps over the lazy dog and then keeps running for a while.";
+        let lower = md.to_lowercase();
+        let snippet = snippet_around_match(md, &lower, "quick").unwrap();
+        assert!(snippet.contains("Quick"));
+        assert!(snippet.starts_with('…'));
+        assert!(snippet.chars().count() <= 90);
+    }
+
+    #[test]
+    fn a_match_is_reported_at_its_original_position_only() {
+        let md = "前言。这里有一个关键词，后面还有很长的内容，继续写下去，直到窗口之外。";
+        let lower = md.to_lowercase();
+        assert!(snippet_around_match(md, &lower, "关键词").is_some());
+        assert!(snippet_around_match(md, &lower, "不存在的词").is_none());
     }
 }

@@ -15,7 +15,9 @@ pub mod model;
 pub mod plum;
 mod preview;
 
-pub use preview::{strip_markdown_syntax, title_and_snippet};
+pub use preview::{
+    search_text, snippet_around_match, strip_markdown_syntax, title_and_snippet,
+};
 
 use crate::ticks;
 use model::{Note, NoteSummary, RemoteUpdate, Tag};
@@ -166,6 +168,17 @@ impl NoteStore {
                 updated_at: row.get(4)?,
             })
         })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every live note's full Markdown, for the app's in-memory search index.
+    /// The list itself only carries previews, so search reads the text once
+    /// and then keeps that index up to date as notes are saved or removed.
+    pub fn search_texts(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, markdown FROM note WHERE deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -813,6 +826,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.save_markdown(&id, "again").unwrap(), i64::MAX - 99);
+    }
+
+    #[test]
+    fn search_texts_returns_the_full_live_markdown() {
+        let store = store();
+        let id = store.create_note("# 标题\n\n正文里的关键词", "Yellow").unwrap();
+        let rows = store.search_texts().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, id);
+        assert!(rows[0].1.contains("关键词"), "got: {:?}", rows[0].1);
+
+        store.soft_delete(&id).unwrap();
+        assert!(store.search_texts().unwrap().is_empty());
     }
 
     #[test]

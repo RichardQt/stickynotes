@@ -7,7 +7,8 @@ use crate::win::{self, TrayEvent};
 use futures::StreamExt as _;
 use gpui_kit::*;
 use std::collections::HashMap;
-use stickynotes_core::config::CloseBehavior;
+use std::time::Duration;
+use stickynotes_core::config::{CloseBehavior, WindowPlacement};
 use stickynotes_core::shortcuts;
 
 impl AppState {
@@ -28,6 +29,11 @@ impl AppState {
             if window.is_window_active() {
                 this.pull_on_return(window, cx);
             }
+        })
+        .detach();
+
+        cx.observe_window_bounds(window, |this, window, cx| {
+            this.remember_window_bounds(window, cx);
         })
         .detach();
 
@@ -73,12 +79,49 @@ impl AppState {
         cx.on_app_quit(|this, cx| {
             this.flush_pending_save(cx);
             this.quick_write(cx);
+            // A move or resize in the last moment may still be waiting for
+            // its debounce.
+            let _ = this.config.save();
             if let Some(tray) = &this.tray {
                 tray.shutdown();
             }
             async {}
         })
         .detach();
+    }
+
+    /// Remember where the window is. Dragging emits a stream of bounds
+    /// changes, so the config file is written once, shortly after the window
+    /// comes to rest; the in-memory value updates on every change.
+    fn remember_window_bounds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = window.window_bounds().get_bounds();
+        let placement = WindowPlacement {
+            x: bounds.origin.x.as_f32(),
+            y: bounds.origin.y.as_f32(),
+            width: bounds.size.width.as_f32(),
+            height: bounds.size.height.as_f32(),
+        };
+        if self.config.window_bounds == Some(placement) {
+            return;
+        }
+        self.config.window_bounds = Some(placement);
+        self.window_bounds_epoch = self.window_bounds_epoch.wrapping_add(1);
+        let epoch = self.window_bounds_epoch;
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(700))
+                    .await;
+                let _ = this.update_in(cx, |this, _window, _cx| {
+                    if this.window_bounds_epoch == epoch {
+                        // Nothing to show on failure: the next start simply
+                        // opens at the previous place.
+                        let _ = this.config.save();
+                    }
+                });
+            })
+            .detach();
     }
 
     /// Whether closing the main window can leave the app running: there is

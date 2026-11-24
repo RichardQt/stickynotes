@@ -223,17 +223,26 @@ impl AppState {
                 Ok(_) => Ok(true),
                 // The note was deleted meanwhile (on another device) while
                 // its text is still being written: keep the text.
-                Err(StoreError::NoteNotFound(_)) => self.quick_create(&text),
+                Err(StoreError::NoteNotFound(_)) => {
+                    self.search_index_remove(&id);
+                    self.quick_create(&text)
+                }
                 Err(e) => Err(e),
             },
         };
 
         match result {
             Ok(changed) => {
-                self.quick_session.saved = if blank { String::new() } else { text };
                 if !changed {
+                    self.quick_session.saved = if blank { String::new() } else { text };
                     return Written::Unchanged;
                 }
+                // The note the quick note just wrote is searchable straight
+                // away, without waiting for a full index rebuild.
+                if let Some(id) = self.quick_session.note_id.clone() {
+                    self.search_index_put(&id, &text);
+                }
+                self.quick_session.saved = if blank { String::new() } else { text };
                 // The main panel lists the note right away.
                 if let Ok(notes) = self.store.list_notes() {
                     self.notes = notes;
@@ -270,6 +279,7 @@ impl AppState {
 
     fn quick_remove(&mut self, id: &str) -> store::Result<bool> {
         self.store.soft_delete(id)?;
+        self.search_index_remove(id);
         // The note may already be on the server: remove it there as well.
         if self.config.webdav_configured() {
             self.webdav_deletions

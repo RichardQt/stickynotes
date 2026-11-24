@@ -134,6 +134,50 @@ impl AppState {
             return;
         }
 
+        // The search box is also the list's keyboard home: arrows walk the
+        // results, Enter goes on into the editor, and Esc clears the query
+        // before it leaves the field. Without this, a query could only be
+        // operated with the mouse again.
+        let search_focused = self
+            .search_input
+            .as_ref()
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if search_focused && plain {
+            match key {
+                "up" => {
+                    cx.stop_propagation();
+                    self.select_relative_note(-1, window, cx);
+                    return;
+                }
+                "down" => {
+                    cx.stop_propagation();
+                    self.select_relative_note(1, window, cx);
+                    return;
+                }
+                "enter" => {
+                    cx.stop_propagation();
+                    if let Some(editor) = &self.editor {
+                        let handle = editor.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                    }
+                    return;
+                }
+                "escape" => {
+                    cx.stop_propagation();
+                    if self.search_query.is_empty() {
+                        if let Some(editor) = &self.editor {
+                            let handle = editor.read(cx).focus_handle(cx);
+                            window.focus(&handle, cx);
+                        }
+                    } else {
+                        self.clear_search(window, cx);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         let body = self
             .editor
             .clone()
@@ -213,6 +257,12 @@ impl AppState {
                     let handle = search.read(cx).focus_handle(cx);
                     window.focus(&handle, cx);
                 }
+            }
+            shortcuts::PREV_NOTE => {
+                self.select_relative_note(-1, window, cx);
+            }
+            shortcuts::NEXT_NOTE => {
+                self.select_relative_note(1, window, cx);
             }
             _ => {}
         }

@@ -147,6 +147,27 @@ pub enum CloseBehavior {
     Tray,
 }
 
+/// How the note list is ordered inside each pinned group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteSort {
+    /// Most recently edited first (the historical order).
+    #[default]
+    RecentUpdated,
+    /// Most recently created first.
+    RecentCreated,
+}
+
+/// Where the main window was last seen, in logical pixels. Written whenever
+/// the window is moved or resized, so the app reopens at the same place.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 fn default_dir() -> String {
     DEFAULT_REMOTE_DIR.to_string()
 }
@@ -205,6 +226,17 @@ pub struct AppConfig {
     pub pull_interval_secs: u64,
     #[serde(default, deserialize_with = "lenient")]
     pub close_behavior: CloseBehavior,
+    /// Order of the note list, within the pinned notes.
+    #[serde(default, deserialize_with = "lenient")]
+    pub note_sort: NoteSort,
+    /// Size and position of the main window, so it reopens where the user
+    /// left it. Missing (or unreadable) means the built-in start bounds.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient"
+    )]
+    pub window_bounds: Option<WindowPlacement>,
     /// Keyboard shortcuts the user changed: action id → key combination, an
     /// empty string for "no shortcut". Actions not listed keep their default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "lenient")]
@@ -224,6 +256,8 @@ impl Default for AppConfig {
             sync_delay_ms: DEFAULT_SYNC_DELAY_MS,
             pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
             close_behavior: CloseBehavior::default(),
+            note_sort: NoteSort::default(),
+            window_bounds: None,
             shortcuts: BTreeMap::new(),
             tray_hint_shown: false,
         }
@@ -333,9 +367,35 @@ mod tests {
         // Written by versions that still had the Microsoft-sync switch.
         let cfg: AppConfig = serde_json::from_str(r#"{"microsoft":true}"#).unwrap();
         assert!(cfg.webdav_auto);
+        assert_eq!(cfg.note_sort, NoteSort::RecentUpdated);
         assert_eq!(cfg.webdav.dir, "/StickyNotes/");
         assert!(cfg.data_dir.is_none());
         assert!(!cfg.legacy_migrated);
+    }
+
+    #[test]
+    fn the_window_placement_round_trips_and_bad_values_are_ignored() {
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"window_bounds":{"x":-40.0,"y":72.0,"width":1180.0,"height":760.0}}"#,
+        )
+        .unwrap();
+        let placed = WindowPlacement { x: -40., y: 72., width: 1180., height: 760. };
+        assert_eq!(cfg.window_bounds, Some(placed));
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.window_bounds, Some(placed));
+
+        // A malformed placement costs only the placement, not the whole file.
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"webdav":{"url":"https://dav.example/","username":"u","password":"p"},
+                "window_bounds":{"x":"left"}}"#,
+        )
+        .unwrap();
+        assert!(cfg.webdav_configured());
+        assert_eq!(cfg.window_bounds, None);
+        assert!(!serde_json::to_string(&AppConfig::default())
+            .unwrap()
+            .contains("window_bounds"));
     }
 
     #[test]

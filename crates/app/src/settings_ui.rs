@@ -9,7 +9,8 @@ use crate::state::{
 };
 use crate::ui::{
     app_logo, field_border_color, group_border_color, ios_field_shadow, lerp_rgba,
-    modal_surface_shadow_faded, nav_pill_shadow_faded, primary_pill_shadow, secondary_pill,
+    modal_surface_shadow_faded, nav_pill_shadow_faded, primary_pill_shadow,
+    primary_pill_shadow_pressed, secondary_pill,
     settings_pill, settings_switch, shell_active, shell_hover, specular_rim, spinning_icon,
     GROUP_BG, INK_MUTED, INK_PRIMARY, INK_SECONDARY, PRIMARY_BTN, PRIMARY_BTN_ACTIVE,
     PRIMARY_BTN_HOVER, SHELL_BG, TITLEBAR_H,
@@ -1372,7 +1373,10 @@ impl AppState {
                         el.shadow(primary_pill_shadow())
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(PRIMARY_BTN_HOVER)))
-                            .active(|s| s.bg(rgb(PRIMARY_BTN_ACTIVE)))
+                            .active(|s| {
+                                s.bg(rgb(PRIMARY_BTN_ACTIVE))
+                                    .shadow(primary_pill_shadow_pressed())
+                            })
                             .on_click(cx.listener(|this, _, window, cx| this.test_webdav(window, cx)))
                     })
                     .when(testing, |el| {
@@ -1961,7 +1965,10 @@ impl AppState {
                                 .shadow(primary_pill_shadow())
                                 .cursor_pointer()
                                 .hover(|s| s.bg(rgb(PRIMARY_BTN_HOVER)))
-                                .active(|s| s.bg(rgb(PRIMARY_BTN_ACTIVE)))
+                                .active(|s| {
+                                s.bg(rgb(PRIMARY_BTN_ACTIVE))
+                                    .shadow(primary_pill_shadow_pressed())
+                            })
                                 .child(
                                     Label::new("打开")
                                         .text_size(px(12.))

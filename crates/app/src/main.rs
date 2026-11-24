@@ -7,7 +7,46 @@ mod ui;
 mod win;
 
 use gpui_kit::*;
-use stickynotes_core::config::{AppConfig, CloseBehavior};
+use stickynotes_core::config::{AppConfig, CloseBehavior, WindowPlacement};
+
+/// The built-in start bounds, used on first run and whenever the saved
+/// placement would be off-screen (for example after a monitor is unplugged).
+fn default_window_bounds() -> WindowBounds {
+    WindowBounds::Windowed(Bounds {
+        origin: Point { x: px(120.), y: px(80.) },
+        size: size(px(1100.), px(720.)),
+    })
+}
+
+/// Reopen where the user left the window, as long as enough of it would still
+/// be visible on one of the current displays. The minimum window size is
+/// enforced here too, so a placement stored by an older version cannot open
+/// a window too small for the three columns.
+fn restored_window_bounds(saved: Option<WindowPlacement>, cx: &App) -> WindowBounds {
+    let Some(saved) = saved else {
+        return default_window_bounds();
+    };
+    let bounds = Bounds {
+        origin: Point { x: px(saved.x), y: px(saved.y) },
+        size: size(
+            px(saved.width.clamp(1000., 4800.)),
+            px(saved.height.clamp(640., 3200.)),
+        ),
+    };
+    let visible = cx.displays().iter().any(|display| {
+        let d = display.bounds();
+        let w = d.right().as_f32().min(bounds.right().as_f32())
+            - d.left().as_f32().max(bounds.left().as_f32());
+        let h = d.bottom().as_f32().min(bounds.bottom().as_f32())
+            - d.top().as_f32().max(bounds.top().as_f32());
+        w >= 160. && h >= 96.
+    });
+    if visible {
+        WindowBounds::Windowed(bounds)
+    } else {
+        default_window_bounds()
+    }
+}
 
 fn main() {
     // Desktop panics otherwise vanish with the window; keep a one-line trace
@@ -65,17 +104,21 @@ fn main() {
             // Started by Windows at sign-in while closing the window means
             // "stay in the notification area": come up there, without a
             // window in the way.
+            let config = AppConfig::load();
             let hidden = win::launched_at_login()
-                && AppConfig::load().close_behavior == CloseBehavior::Tray;
+                && config.close_behavior == CloseBehavior::Tray;
+            let window_bounds = restored_window_bounds(config.window_bounds, cx);
 
             let (main, _) = gpui_kit::open_window(
                 WindowOptions {
                     show: !hidden,
                     focus: !hidden,
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point { x: px(120.), y: px(80.) },
-                        size: size(px(1100.), px(720.)),
-                    })),
+                    window_bounds: Some(window_bounds),
+                    // Below this the three columns leave too little for the
+                    // note paper: the editor toolbar starts hiding tools and
+                    // table cells wrap one character per line. The window
+                    // itself refuses to shrink past it.
+                    window_min_size: Some(size(px(1000.), px(640.))),
                     titlebar: Some(TitlebarOptions {
                         title: Some("便签 Sticky Notes".into()),
                         // Immersive light titlebar: the app draws its own bar and

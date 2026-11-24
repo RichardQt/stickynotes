@@ -292,6 +292,24 @@ pub struct MdTip {
     pub glide: bool,
 }
 
+/// One note's text kept for search: the original Markdown, so a match can be
+/// shown with its own casing, and the lowercased form to match in.
+#[derive(Clone)]
+struct SearchEntry {
+    markdown: String,
+    lower: String,
+}
+
+impl SearchEntry {
+    fn new(markdown: String) -> Self {
+        // Search over the preview form: table rows read as text and fence
+        // markers are gone, so a match window is not full of raw syntax.
+        let markdown = store::search_text(&markdown);
+        let lower = markdown.to_lowercase();
+        Self { markdown, lower }
+    }
+}
+
 pub struct AppState {
     /// The app's own database: notes, tags and pins.
     pub store: NoteStore,
@@ -312,6 +330,10 @@ pub struct AppState {
     pub note_tags_map: HashMap<String, Vec<Tag>>,
     pub tag_counts: HashMap<i64, usize>,
     pub pinned: HashSet<String>,
+    /// Full text of every live note, built the first time a search is typed.
+    /// `None` means "not built yet": search then matches the previews in
+    /// `notes`, which is all the list already holds.
+    search_index: Option<HashMap<String, SearchEntry>>,
 
     // Typing debounce & stats cache
     pub save_epoch: u64,
@@ -326,6 +348,9 @@ pub struct AppState {
     pub pending_save: Option<(String, String)>,
     /// When the background loop next checks whether a backup is due.
     next_backup_check: Instant,
+    /// Bumped on every window move/resize so only the last debounced save of
+    /// the window placement runs.
+    window_bounds_epoch: u64,
 
     // Settings: storage
     pub config: AppConfig,
@@ -500,6 +525,9 @@ impl AppState {
             if matches!(event, InputEvent::Change) {
                 let text = input.read(cx).value().to_string();
                 this.search_query = text;
+                if !this.search_query.trim().is_empty() {
+                    this.ensure_search_index();
+                }
                 this.ensure_selection_after_filter(window, cx);
                 cx.notify();
             }
@@ -522,11 +550,13 @@ impl AppState {
             note_tags_map: HashMap::new(),
             tag_counts: HashMap::new(),
             pinned: HashSet::new(),
+            search_index: None,
             save_epoch: 0,
             current_stats: (0, 0),
             last_saved_md: None,
             pending_save: None,
             next_backup_check: Instant::now(),
+            window_bounds_epoch: 0,
             config,
             show_settings: false,
             settings: None,
@@ -657,6 +687,9 @@ impl AppState {
     fn show_store_contents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection();
         self.pending_save = None;
+        // Another database means another set of texts; search rebuilds it
+        // lazily on the next query.
+        self.search_index = None;
         match self.store.list_notes() {
             Ok(notes) => self.notes = notes,
             Err(e) => {
@@ -665,6 +698,9 @@ impl AppState {
             }
         }
         self.reload_tags_cache();
+        if !self.search_query.trim().is_empty() {
+            self.ensure_search_index();
+        }
         self.select_note_by_index(0, window, cx);
         cx.notify();
     }
@@ -719,6 +755,48 @@ impl AppState {
             .unwrap_or(&THEMES[0])
     }
 
+    /// Full-text search is loaded the first time a query is typed: until
+    /// then the list only holds previews, which are enough for a plain title
+    /// lookup and cost nothing extra at startup.
+    fn ensure_search_index(&mut self) {
+        if self.search_index.is_some() {
+            return;
+        }
+        match self.store.search_texts() {
+            Ok(rows) => {
+                self.search_index = Some(
+                    rows.into_iter()
+                        .map(|(id, markdown)| (id, SearchEntry::new(markdown)))
+                        .collect(),
+                );
+            }
+            Err(e) => debug_log(&format!("search index failed: {e}")),
+        }
+    }
+
+    /// Keep a built index in step with a note's saved text.
+    fn search_index_put(&mut self, id: &str, markdown: &str) {
+        if let Some(index) = &mut self.search_index {
+            index.insert(id.to_string(), SearchEntry::new(markdown.to_string()));
+        }
+    }
+
+    fn search_index_remove(&mut self, id: &str) {
+        if let Some(index) = &mut self.search_index {
+            index.remove(id);
+        }
+    }
+
+    /// Rebuild the index after notes changed underneath it (a reload, a
+    /// remote pass or a database switch). Does nothing until search has been
+    /// used once.
+    fn refresh_search_index(&mut self) {
+        if self.search_index.is_some() {
+            self.search_index = None;
+            self.ensure_search_index();
+        }
+    }
+
     pub fn filtered_notes(&self) -> Vec<NoteSummary> {
         let mut notes: Vec<NoteSummary> = match self.tag_filter {
             None => self.notes.clone(),
@@ -737,15 +815,62 @@ impl AppState {
 
         let q = self.search_query.trim().to_lowercase();
         if !q.is_empty() {
-            notes.retain(|n| {
-                n.title.to_lowercase().contains(&q) || n.snippet.to_lowercase().contains(&q)
-            });
+            match &self.search_index {
+                // The index holds each note's whole Markdown, so a word deep
+                // in the body finds the note as well as its title does.
+                Some(index) => {
+                    notes.retain(|n| index.get(&n.id).is_some_and(|e| e.lower.contains(&q)));
+                    // A match buried in the body would otherwise sit behind a
+                    // preview that never mentions it: show the words around it.
+                    for note in &mut notes {
+                        let Some(entry) = index.get(&note.id) else { continue };
+                        if note.title.to_lowercase().contains(&q)
+                            || note.snippet.to_lowercase().contains(&q)
+                        {
+                            continue;
+                        }
+                        if let Some(snippet) =
+                            store::snippet_around_match(&entry.markdown, &entry.lower, &q)
+                        {
+                            note.snippet = snippet;
+                        }
+                    }
+                }
+                // The index could not be read: the previews still answer a
+                // title lookup rather than making search look broken.
+                None => notes.retain(|n| {
+                    n.title.to_lowercase().contains(&q) || n.snippet.to_lowercase().contains(&q)
+                }),
+            }
         }
 
-        // Pinned notes float to the top; the stable sort keeps the
-        // newest-first order within each group.
-        notes.sort_by_key(|n| !self.pinned.contains(&n.id));
+        // Pinned notes float to the top; inside each group the user's chosen
+        // order. The id tiebreak keeps equal timestamps from swapping places
+        // between renders.
+        notes.sort_by(|a, b| {
+            let ap = self.pinned.contains(&a.id);
+            let bp = self.pinned.contains(&b.id);
+            bp.cmp(&ap)
+                .then_with(|| match self.config.note_sort {
+                    config::NoteSort::RecentUpdated => b.updated_at.cmp(&a.updated_at),
+                    config::NoteSort::RecentCreated => b.created_at.cmp(&a.created_at),
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
         notes
+    }
+
+    /// Switch the list between "most recently edited" and "most recently
+    /// created"; pinned notes stay on top in both.
+    pub fn set_note_sort(&mut self, sort: config::NoteSort, cx: &mut Context<Self>) {
+        if self.config.note_sort == sort {
+            return;
+        }
+        self.config.note_sort = sort;
+        if let Err(e) = self.config.save() {
+            self.status = SyncStatus::Error(format!("保存排序设置失败：{e}"));
+        }
+        cx.notify();
     }
 
     /// Close the open note without saving it. Callers that may hold unsaved
@@ -838,6 +963,35 @@ impl AppState {
         self.last_saved_md = Some(self.compose_md(cx));
         self.update_stats_from_editor(cx);
         cx.notify();
+    }
+
+    /// Move the selection by one row in the current filtered, ordered list.
+    /// Used by the search box's arrow keys and the previous/next shortcuts;
+    /// at either end the selection stays put. Returns whether it moved.
+    pub fn select_relative_note(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let notes = self.filtered_notes();
+        if notes.is_empty() {
+            return false;
+        }
+        let current = self
+            .selected_id
+            .as_deref()
+            .and_then(|id| notes.iter().position(|n| n.id == id));
+        let index = match current {
+            Some(i) => (i as isize + delta).clamp(0, notes.len() as isize - 1) as usize,
+            None => 0,
+        };
+        if Some(notes[index].id.as_str()) == self.selected_id.as_deref() {
+            return false;
+        }
+        let id = notes[index].id.clone();
+        self.select_note(&id, window, cx);
+        true
     }
 
     pub fn select_note_by_index(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -975,6 +1129,7 @@ impl AppState {
         match self.store.save_markdown(&id, &md) {
             Ok(updated_at) => {
                 self.status = SyncStatus::Saved("已自动保存".into());
+                self.search_index_put(&id, &md);
                 self.last_saved_md = Some(md.clone());
                 self.pending_save = None;
                 if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
@@ -1135,6 +1290,7 @@ impl AppState {
             Err(e) => self.status = SyncStatus::Error(format!("读取便签失败：{e}")),
         }
         self.reload_tags_cache();
+        self.refresh_search_index();
         let keep = self.selected_id.take();
         self.clear_selection();
         let visible = self.filtered_notes();
@@ -1352,6 +1508,7 @@ impl AppState {
         match self.store.save_markdown(&id, &md) {
             Ok(updated_at) => {
                 self.pending_save = None;
+                self.search_index_put(&id, &md);
                 if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
                     note.updated_at = updated_at;
                 }
@@ -2394,6 +2551,7 @@ impl AppState {
             Err(e) => self.status = SyncStatus::Error(format!("读取便签失败：{e}")),
         }
         self.reload_tags_cache();
+        self.refresh_search_index();
 
         let Some(id) = self.selected_id.clone() else {
             self.select_note_by_index(0, window, cx);

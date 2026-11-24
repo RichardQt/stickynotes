@@ -41,6 +41,8 @@ pub const QUICK_NOTE: &str = "quick_note";
 pub const OPEN_MAIN: &str = "open_main";
 pub const NEW_TAG: &str = "new_tag";
 pub const SEARCH: &str = "search";
+pub const PREV_NOTE: &str = "prev_note";
+pub const NEXT_NOTE: &str = "next_note";
 pub const MD_PARAGRAPH: &str = "md_paragraph";
 pub const MD_H1: &str = "md_h1";
 pub const MD_H2: &str = "md_h2";
@@ -69,6 +71,10 @@ pub const ACTIONS: &[ActionDef] = &[
     action(OPEN_MAIN, "打开主面板", Group::Global, "Ctrl+Alt+S"),
     action(NEW_TAG, "新建标签", Group::General, "Ctrl+Shift+N"),
     action(SEARCH, "搜索便签", Group::General, "Ctrl+F"),
+    // Arrow keys are editing keys by this app's shortcut policy (and Alt+Up
+    // moves lines in many editors): P/N are free, mnemonic and safe.
+    action(PREV_NOTE, "上一条便签", Group::General, "Alt+P"),
+    action(NEXT_NOTE, "下一条便签", Group::General, "Alt+N"),
     action(MD_PARAGRAPH, "正文", Group::Markdown, "Ctrl+Alt+0"),
     action(MD_H1, "一级标题", Group::Markdown, "Ctrl+Alt+1"),
     action(MD_H2, "二级标题", Group::Markdown, "Ctrl+Alt+2"),
