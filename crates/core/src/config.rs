@@ -184,6 +184,12 @@ pub struct WebDavConfig {
     /// Collection on the server; created with MKCOL when missing.
     #[serde(default = "default_dir")]
     pub dir: String,
+    /// Optional proxy for sync traffic, e.g. `http://127.0.0.1:7890` or
+    /// `socks5://127.0.0.1:7891`. Empty connects directly: the sync client
+    /// reads proxy environment variables only, never the Windows system
+    /// proxy setting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy: String,
 }
 
 impl Default for WebDavConfig {
@@ -193,6 +199,7 @@ impl Default for WebDavConfig {
             username: String::new(),
             password: String::new(),
             dir: default_dir(),
+            proxy: String::new(),
         }
     }
 }
@@ -360,6 +367,21 @@ mod tests {
         assert!(!cfg.webdav_configured());
         assert!(cfg.uses_default_data_dir());
         assert_eq!(cfg.database_path(), default_data_dir().join("stickynotes.db"));
+    }
+
+    #[test]
+    fn a_proxy_is_optional_and_round_trips() {
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.webdav.proxy.is_empty());
+        assert!(!serde_json::to_string(&cfg).unwrap().contains("proxy"));
+
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"webdav":{"proxy":"socks5://127.0.0.1:7891"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.webdav.proxy, "socks5://127.0.0.1:7891");
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(text.contains(r#""proxy":"socks5://127.0.0.1:7891""#), "{text}");
     }
 
     #[test]

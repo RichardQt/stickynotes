@@ -172,6 +172,8 @@ pub struct SettingsInputs {
     pub user: Entity<InputState>,
     pub pass: Entity<InputState>,
     pub dir: Entity<InputState>,
+    /// Optional proxy for sync traffic; empty means a direct connection.
+    pub proxy: Entity<InputState>,
     /// Seconds between the last edit and the automatic upload.
     pub delay: Entity<InputState>,
 }
@@ -1628,7 +1630,13 @@ impl AppState {
             s.set_value(dir, window, cx);
             s
         });
-        self.settings = Some(SettingsInputs { url, user, pass, dir, delay });
+        let proxy = cx.new(|cx| {
+            let mut s = InputState::new(window, cx)
+                .placeholder("http://127.0.0.1:7890（留空则直连）");
+            s.set_value(w.proxy.clone(), window, cx);
+            s
+        });
+        self.settings = Some(SettingsInputs { url, user, pass, dir, proxy, delay });
     }
 
     /// The sync-delay field changed. A valid delay takes effect and is saved
@@ -1669,8 +1677,8 @@ impl AppState {
     }
 
     /// Copy the form back into the config and persist it. Returns whether the
-    /// WebDAV target (server, credentials, collection) actually changed — the
-    /// only case that is worth a sync of its own.
+    /// WebDAV connection (server, credentials, collection or proxy) actually
+    /// changed — the only case that is worth a sync of its own.
     fn persist_settings(&mut self, cx: &App) -> bool {
         let before = self.config.webdav.clone();
         if let Some(s) = &self.settings {
@@ -1683,17 +1691,23 @@ impl AppState {
             } else {
                 dir
             };
+            self.config.webdav.proxy = s.proxy.read(cx).value().trim().to_string();
         }
         let target_changed = before.url != self.config.webdav.url
             || before.username != self.config.webdav.username
             || before.password != self.config.webdav.password
             || before.dir != self.config.webdav.dir;
+        let proxy_changed = before.proxy != self.config.webdav.proxy;
         if target_changed {
             // The version cache and the "directory exists" assumption belong
             // to the old server/credentials.
             self.webdav_cache = webdav::SyncCache::default();
             self.webdav_deletions = webdav::DeleteLedger::default();
             self.webdav_dir_ready = false;
+        }
+        if target_changed || proxy_changed {
+            // A changed connection deserves an immediate try, not the backoff
+            // left over from the previous one.
             self.webdav_failures = 0;
             self.webdav_failed = false;
             self.webdav_next_try = Instant::now();
@@ -1701,7 +1715,7 @@ impl AppState {
         if let Err(e) = self.config.save() {
             self.status = SyncStatus::Error(format!("保存设置失败：{e}"));
         }
-        target_changed
+        target_changed || proxy_changed
     }
 
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {

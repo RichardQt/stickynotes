@@ -665,16 +665,52 @@ fn same_version(cached: &CachedFile, entry: &RemoteEntry) -> bool {
     }
 }
 
+/// The configured proxy as reqwest wants it, or `None` for a direct
+/// connection. A bare `127.0.0.1:7890` means an HTTP proxy.
+fn proxy_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    })
+}
+
+/// The full reason a request failed. reqwest's own message names the URL but
+/// keeps the cause (DNS, connect timeout, TLS, proxy) in its source chain.
+fn describe_error(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && !text.contains(&cause_text) {
+            text.push_str("：");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 impl WebDavClient {
     pub fn new(cfg: &WebDavConfig) -> Result<Self, String> {
         let base = cfg.url.trim().trim_end_matches('/');
         if base.is_empty() {
             return Err("WebDAV 地址不能为空".into());
         }
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("StickyNotes/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("StickyNotes/", env!("CARGO_PKG_VERSION")));
+        if let Some(proxy) = proxy_url(&cfg.proxy) {
+            let proxy = reqwest::Proxy::all(&proxy)
+                .map_err(|e| format!("代理地址无效（{proxy}）：{e}"))?;
+            builder = builder.proxy(proxy);
+        }
+        let client = builder
             .build()
             .map_err(|e| format!("无法创建 HTTP 客户端：{e}"))?;
         Ok(Self {
@@ -704,7 +740,7 @@ impl WebDavClient {
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(PROPFIND_BODY)
             .send()
-            .map_err(|e| format!("连接失败：{e}"))?;
+            .map_err(|e| format!("连接失败：{}", describe_error(&e)))?;
         let status = resp.status();
         if status.is_success() {
             Ok(format!("连接成功（HTTP {}）", status.as_u16()))
@@ -728,7 +764,7 @@ impl WebDavClient {
             let resp = self
                 .request(method.clone(), &self.url(&format!("{path}/")))
                 .send()
-                .map_err(|e| format!("创建目录失败：{e}"))?;
+                .map_err(|e| format!("创建目录失败：{}", describe_error(&e)))?;
             let status = resp.status();
             // 405 = already exists; 301 = server wants the canonical slash URL.
             if !(status.is_success() || status.as_u16() == 405 || status.as_u16() == 301) {
@@ -753,7 +789,7 @@ impl WebDavClient {
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(PROPFIND_BODY)
             .send()
-            .map_err(|e| format!("获取文件列表失败：{e}"))?;
+            .map_err(|e| format!("获取文件列表失败：{}", describe_error(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("获取文件列表失败：HTTP {}", status.as_u16()));
@@ -771,7 +807,7 @@ impl WebDavClient {
         let resp = self
             .request(Method::GET, &self.url(&join_path(dir, name)))
             .send()
-            .map_err(|e| format!("下载 {name} 失败：{e}"))?;
+            .map_err(|e| format!("下载 {name} 失败：{}", describe_error(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("下载 {name} 失败：HTTP {}", status.as_u16()));
@@ -786,7 +822,7 @@ impl WebDavClient {
             .header("Content-Type", "text/markdown; charset=utf-8")
             .body(content.to_string())
             .send()
-            .map_err(|e| format!("上传 {name} 失败：{e}"))?;
+            .map_err(|e| format!("上传 {name} 失败：{}", describe_error(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("上传 {name} 失败：HTTP {}", status.as_u16()));
@@ -806,7 +842,7 @@ impl WebDavClient {
         let resp = self
             .request(Method::DELETE, &self.url(&join_path(dir, name)))
             .send()
-            .map_err(|e| format!("删除 {name} 失败：{e}"))?;
+            .map_err(|e| format!("删除 {name} 失败：{}", describe_error(&e)))?;
         let status = resp.status();
         if status.is_success() {
             Ok(true)
@@ -1268,6 +1304,54 @@ mod tests {
         assert_eq!(join_path("", "a.md"), "/a.md");
     }
 
+    #[test]
+    fn a_bare_proxy_address_means_http_and_blank_means_direct() {
+        assert_eq!(proxy_url(""), None);
+        assert_eq!(proxy_url("  "), None);
+        assert_eq!(
+            proxy_url(" 127.0.0.1:7890 ").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            proxy_url("http://127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            proxy_url("socks5://127.0.0.1:7891").as_deref(),
+            Some("socks5://127.0.0.1:7891")
+        );
+    }
+
+    #[test]
+    fn an_invalid_proxy_is_rejected_before_any_request() {
+        let cfg = WebDavConfig {
+            url: "https://example.com/dav/".into(),
+            proxy: "http://".into(),
+            ..Default::default()
+        };
+        let error = WebDavClient::new(&cfg).err().expect("http:// has no host");
+        assert!(error.contains("代理地址无效"), "{error}");
+    }
+
+    #[test]
+    fn connection_errors_keep_their_underlying_cause() {
+        // The port was bound and released, so nothing listens on it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = Client::builder().no_proxy().build().unwrap();
+        let error = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .expect_err("nothing listens on the freed port");
+        let described = describe_error(&error);
+        assert_ne!(
+            described,
+            error.to_string(),
+            "the cause must be appended, got: {described}"
+        );
+    }
+
     /// Minimal scripted HTTP server so WebDAV edge cases run offline and bypass
     /// any system HTTP proxy.
     fn run_mock_dav(
@@ -1328,6 +1412,7 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
             dir: "/StickyNotes".into(),
+            proxy: String::new(),
         };
         let client = WebDavClient {
             client: Client::builder().no_proxy().build().unwrap(),

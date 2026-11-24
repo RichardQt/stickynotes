@@ -1348,7 +1348,20 @@ impl AppState {
                     false,
                     window,
                     cx,
-                ));
+                ))
+                .child(form_field(
+                    "settings-proxy",
+                    "代理（可选）",
+                    &inputs.proxy,
+                    false,
+                    window,
+                    cx,
+                ))
+                .child(
+                    Label::new("支持 http:// 与 socks5:// 代理；留空则直连。")
+                        .text_size(px(10.5))
+                        .text_color(muted),
+                );
         }
 
         let mut actions = h_flex()
@@ -1440,7 +1453,12 @@ impl AppState {
                     .when_some(maybe_icon, |el, ic| {
                         el.child(Icon::new(ic).size(px(11.)).text_color(color))
                     })
-                    .child(Label::new(msg).text_size(px(11.)).text_color(color)),
+                    .child(
+                        Label::new(msg)
+                            .text_size(px(11.))
+                            .text_color(color)
+                            .whitespace_normal(),
+                    ),
             );
         } else if let Some(msg) = &self.webdav_message {
             // Same reading as the test line above: green when it worked, red
@@ -1459,7 +1477,12 @@ impl AppState {
                     .when_some(maybe_icon, |el, ic| {
                         el.child(Icon::new(ic).size(px(11.)).text_color(color))
                     })
-                    .child(Label::new(msg.clone()).text_size(px(11.)).text_color(color)),
+                    .child(
+                        Label::new(msg.clone())
+                            .text_size(px(11.))
+                            .text_color(color)
+                            .whitespace_normal(),
+                    ),
             );
         }
 
