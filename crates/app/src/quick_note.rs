@@ -144,6 +144,7 @@ impl QuickNote {
                 this.request(QuickAction::Edited, cx);
                 cx.notify();
             }
+            BlockEditorEvent::LinkClicked { url } => crate::state::open_note_link(url, cx),
             // Enter. While an input method is composing, the editor keeps
             // the key for the candidate and never gets here.
             BlockEditorEvent::SubmitRequested => this.request(QuickAction::Close, cx),

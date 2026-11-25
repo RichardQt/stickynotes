@@ -28,15 +28,15 @@ use stickynotes_core::config::{self, CloseBehavior, SyncDelayError};
 use stickynotes_core::shortcuts::{self, ActionDef, Combo, Group};
 
 /// Accent of the settings dialog: switches, selected items, links.
-const ACCENT: u32 = 0x3B6EA8;
+pub(crate) const ACCENT: u32 = 0x3B6EA8;
 /// Opacity of a setting that currently has no effect (its switch is off):
 /// still legible, clearly stepped back from the live rows around it.
 const DISABLED_ALPHA: f32 = 0.42;
 /// The red of destructive actions and of refused input.
-const DANGER: u32 = 0xE5484D;
+pub(crate) const DANGER: u32 = 0xE5484D;
 const DANGER_HOVER: u32 = 0xDC3E42;
 const DANGER_ACTIVE: u32 = 0xCE2C31;
-const ERROR_INK: u32 = 0xC04646;
+pub(crate) const ERROR_INK: u32 = 0xC04646;
 const SUCCESS_INK: u32 = 0x2A8555;
 
 // =========================================================================
@@ -218,7 +218,7 @@ fn outcome_note(
 }
 
 /// Soft outer focus/error halo paired with `.border_1().border_color(rgb(color))`.
-fn field_ring(color: u32) -> Vec<BoxShadow> {
+pub(crate) fn field_ring(color: u32) -> Vec<BoxShadow> {
     let mut ring = rgb(color);
     ring.a = 0.16;
     vec![BoxShadow {
@@ -1039,14 +1039,13 @@ impl AppState {
             )
     }
 
-    /// Automatic sync, debounce delay, pull interval, WebDAV credentials, and
-    /// test/sync actions unified inside one snow-porcelain card.
+    /// Automatic sync, debounce delay, WebDAV credentials, and test/sync
+    /// actions unified inside one snow-porcelain card.
     fn render_sync_group(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let in_effect = config::format_sync_delay_secs(self.config.sync_delay_ms);
-        let interval_secs = config::clamp_pull_interval_secs(self.config.pull_interval_secs);
-        // The pull interval and the upload delay only shape automatic sync.
-        // While it is off they stay readable but step back and cannot be
-        // changed, so the switch reads as the thing that governs them.
+        // The upload delay only shapes automatic sync. While it is off it stays
+        // readable but steps back and cannot be changed, so the switch reads as
+        // the thing that governs it.
         let auto_on = self.config.webdav_auto;
         let params_alpha = transition(
             "sync-params-alpha",
@@ -1124,9 +1123,8 @@ impl AppState {
                     .justify_between()
                     .items_center()
                     .gap_3()
-                    // Only what the switch itself decides. When and how often
-                    // sync runs is the business of the two rows below it;
-                    // repeating their values here made them read as duplicates.
+                    // Only what the switch itself decides; upload timing is
+                    // configured in the row below it.
                     .child(setting_text(
                         "自动同步（WebDAV）",
                         "开启后自动上传本机的修改、下载其他设备的改动；关闭后只在点「立即同步」时同步。",
@@ -1146,8 +1144,6 @@ impl AppState {
                     ),
             )
             .child(row_divider())
-            .child(self.render_pull_interval_row(interval_secs, auto_on, params_alpha, window, cx))
-            .child(row_divider())
             .child(
                 v_flex()
                     .py(px(12.))
@@ -1161,167 +1157,6 @@ impl AppState {
             )
             .child(row_divider())
             .child(self.render_webdav_form(window, cx))
-    }
-
-    /// "检查其他设备更新": how often the background loop looks at the server.
-    /// `enabled` is false while automatic sync is off: the row is drawn at
-    /// `alpha` and its dropdown no longer opens.
-    fn render_pull_interval_row(
-        &self,
-        interval_secs: u64,
-        enabled: bool,
-        alpha: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let open = enabled && self.settings_menu == Some(SettingsMenu::PullInterval);
-        let chevron_rot = spring(
-            "pull-chevron-rot",
-            if open { 0.5_f32 } else { 0.0_f32 },
-            Spring::new(Duration::from_millis(190))
-                .with_damping(0.78)
-                .with_epsilon(0.002),
-            window,
-            cx,
-        );
-        let menu_transition = if open {
-            Transition::new(Duration::from_millis(165)).ease(cubic_bezier(0.16, 1.0, 0.3, 1.0))
-        } else {
-            Transition::new(Duration::from_millis(115)).ease(ease_out_cubic)
-        };
-        let menu_presence = Presence::new("pull-interval-menu-presence", open)
-            .transition(menu_transition)
-            .sample(window, cx);
-
-        let mut menu = v_flex()
-            .id("pull-interval-menu")
-            .absolute()
-            .top(px(29. + 6. * menu_presence.progress))
-            .right(px(0.))
-            .w(px(148.))
-            .p(px(4.))
-            .gap(px(2.))
-            .opacity(menu_presence.progress)
-            .rounded(px(12.))
-            .bg(rgb(0xFFFFFF))
-            .border_1()
-            .border_color(hsla(220. / 360., 0.20, 0.16, 0.10))
-            .shadow(menu_shadow_faded(menu_presence.progress))
-            .occlude();
-        for secs in config::PULL_INTERVAL_CHOICES_SECS {
-            let selected = interval_secs == secs;
-            let label = config::format_pull_interval(secs);
-            menu = menu.child(
-                h_flex()
-                    .id(ElementId::Name(format!("pull-option-{secs}").into()))
-                    .h(px(32.))
-                    .px(px(9.))
-                    .gap(px(7.))
-                    .items_center()
-                    .rounded(px(8.))
-                    .cursor_pointer()
-                    .when(selected, |el| el.bg(hsla(212. / 360., 0.52, 0.48, 0.08)))
-                    .hover(|s| s.bg(shell_hover()))
-                    .active(|s| s.bg(shell_active()))
-                    .child(
-                        div()
-                            .w(px(13.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(selected, |el| {
-                                el.child(
-                                    Icon::new(IconName::Check)
-                                        .size(px(12.))
-                                        .text_color(rgb(ACCENT)),
-                                )
-                            }),
-                    )
-                    .child(
-                        Label::new(label)
-                            .text_size(px(12.))
-                            .font_weight(if selected {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(rgb(if selected { ACCENT } else { INK_PRIMARY })),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_pull_interval(secs, cx);
-                    })),
-            );
-        }
-
-        let dropdown = div()
-            .relative()
-            .flex_none()
-            .child(
-                h_flex()
-                    .id("pull-interval")
-                    .h(px(30.))
-                    .pl(px(12.))
-                    .pr(px(9.))
-                    .gap(px(7.))
-                    .items_center()
-                    .rounded(px(9.))
-                    .bg(rgb(0xFFFFFF))
-                    .border_1()
-                    .border_color(if open {
-                        rgb(ACCENT).into()
-                    } else {
-                        field_border_color()
-                    })
-                    .shadow(if open {
-                        field_ring(ACCENT)
-                    } else {
-                        ios_field_shadow()
-                    })
-                    .when(enabled, |el| {
-                        el.cursor_pointer()
-                            .hover(|s| s.bg(rgb(0xFAFBFD)))
-                            .active(|s| s.bg(rgb(0xECEEF4)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.cancel_shortcut_recording(cx);
-                                this.settings_menu = match this.settings_menu {
-                                    Some(SettingsMenu::PullInterval) => None,
-                                    _ => Some(SettingsMenu::PullInterval),
-                                };
-                                cx.notify();
-                            }))
-                    })
-                    .child(
-                        Label::new(config::format_pull_interval(interval_secs))
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(INK_PRIMARY)),
-                    )
-                    .child(
-                        Icon::new(AssetIconName::ChevronDown)
-                            .size(px(12.))
-                            .flex_none()
-                            .rotate(percentage(chevron_rot.rem_euclid(1.0)))
-                            .text_color(rgb(if open { ACCENT } else { INK_MUTED })),
-                    ),
-            )
-            .when(menu_presence.should_render(), |el| {
-                el.child(deferred(menu).with_priority(1))
-            });
-
-        h_flex()
-            .py(px(12.))
-            .justify_between()
-            .items_center()
-            .gap_3()
-            .opacity(alpha)
-            .child(setting_text(
-                "检查其他设备更新",
-                "后台每隔多久查看服务器；启动、切回窗口时立即检查，藏在托盘时至少 10 分钟。",
-            ))
-            .child(dropdown)
     }
 
     /// Server, credentials and the two buttons that try them out.

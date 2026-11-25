@@ -49,9 +49,11 @@ pub const MD_H2: &str = "md_h2";
 pub const MD_H3: &str = "md_h3";
 pub const MD_BOLD: &str = "md_bold";
 pub const MD_ITALIC: &str = "md_italic";
+pub const MD_UNDERLINE: &str = "md_underline";
 pub const MD_STRIKE: &str = "md_strike";
 pub const MD_CODE: &str = "md_code";
 pub const MD_HIGHLIGHT: &str = "md_highlight";
+pub const MD_LINK: &str = "md_link";
 pub const MD_BULLET: &str = "md_bullet";
 pub const MD_ORDERED: &str = "md_ordered";
 pub const MD_TASK: &str = "md_task";
@@ -81,9 +83,11 @@ pub const ACTIONS: &[ActionDef] = &[
     action(MD_H3, "三级标题", Group::Markdown, "Ctrl+Alt+3"),
     action(MD_BOLD, "加粗", Group::Markdown, "Ctrl+B"),
     action(MD_ITALIC, "斜体", Group::Markdown, "Ctrl+I"),
+    action(MD_UNDERLINE, "下划线", Group::Markdown, "Ctrl+U"),
     action(MD_STRIKE, "删除线", Group::Markdown, "Ctrl+Shift+X"),
     action(MD_CODE, "行内代码", Group::Markdown, "Ctrl+E"),
     action(MD_HIGHLIGHT, "文本高亮", Group::Markdown, "Ctrl+Shift+H"),
+    action(MD_LINK, "超链接", Group::Markdown, "Ctrl+K"),
     action(MD_BULLET, "无序列表", Group::Markdown, "Ctrl+Shift+U"),
     action(MD_ORDERED, "有序列表", Group::Markdown, "Ctrl+Shift+O"),
     action(MD_TASK, "待办清单", Group::Markdown, "Ctrl+Shift+T"),

@@ -41,7 +41,15 @@ pub fn strip_markdown_syntax(input: &str) -> String {
         // Link `[label](url)` -> `label`
         if chars[i] == '[' {
             if let Some((label, next_idx)) = parse_md_link(&chars, i) {
-                out.push_str(&label);
+                out.push_str(&strip_markdown_syntax(&label));
+                i = next_idx;
+                continue;
+            }
+        }
+        // Strip inline HTML formatting tags (`<u>`, `<mark>`, ...) and unwrap `<https://...>` autolinks
+        if chars[i] == '<' {
+            if let Some((replacement, next_idx)) = parse_inline_angle(&chars, i) {
+                out.push_str(&replacement);
                 i = next_idx;
                 continue;
             }
@@ -64,6 +72,40 @@ pub fn strip_markdown_syntax(input: &str) -> String {
 
     // Collapse consecutive whitespace into a single space
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_inline_angle(chars: &[char], start: usize) -> Option<(String, usize)> {
+    debug_assert_eq!(chars[start], '<');
+    let mut close = None;
+    for (j, &ch) in chars.iter().enumerate().skip(start + 1) {
+        if ch == '<' {
+            return None;
+        }
+        if ch == '>' {
+            close = Some(j);
+            break;
+        }
+    }
+    let close = close?;
+    let inner: String = chars[start + 1..close].iter().collect();
+    let trimmed = inner.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "u" | "/u" | "s" | "/s" | "del" | "/del" | "mark" | "/mark" | "em" | "/em" | "strong" | "/strong"
+    ) || lower.starts_with("mark ")
+    {
+        return Some((String::new(), close + 1));
+    }
+    if !trimmed.chars().any(char::is_whitespace)
+        && (lower.starts_with("https://")
+            || lower.starts_with("http://")
+            || lower.starts_with("mailto:")
+            || lower.starts_with("tel:"))
+    {
+        return Some((trimmed.to_string(), close + 1));
+    }
+    None
 }
 
 fn parse_md_link(chars: &[char], start_bracket: usize) -> Option<(String, usize)> {
@@ -299,6 +341,15 @@ mod tests {
         assert!(snippet.contains("Quick"));
         assert!(snippet.starts_with('…'));
         assert!(snippet.chars().count() <= 90);
+    }
+
+    #[test]
+    fn underline_highlight_and_links_preview_as_clean_text() {
+        let (title, snippet) = title_and_snippet(
+            "<u>重点</u>\n\n请查看 [<u>官网</u>](https://example.com) 或 <https://rust-lang.org> 和 <mark>高亮</mark>",
+        );
+        assert_eq!(title, "重点");
+        assert_eq!(snippet, "请查看 官网 或 https://rust-lang.org 和 高亮");
     }
 
     #[test]

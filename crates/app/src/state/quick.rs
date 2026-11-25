@@ -92,6 +92,10 @@ impl AppState {
     /// dialog then: the settings would otherwise sit behind it and still get
     /// its key presses.
     fn show_quick_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link_popover_open {
+            self.link_popover_open = false;
+            self.link_popover = None;
+        }
         if self.show_settings {
             self.close_settings(window, cx);
         }

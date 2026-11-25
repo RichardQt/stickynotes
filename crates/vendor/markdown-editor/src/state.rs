@@ -271,6 +271,18 @@ impl CopyKind {
     }
 }
 
+/// Link context at the caret or selection, for a host link popover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkTarget {
+    /// Current display text if single-leaf (empty when collapsed outside a link),
+    /// `None` when editing text is skipped (multi-block or atom selection).
+    pub text: Option<String>,
+    /// Existing link URL covering the caret/selection, if any.
+    pub url: Option<SharedString>,
+    /// Whether any part of the caret/selection already carries a link mark.
+    pub has_link: bool,
+}
+
 /// Events emitted by [`BlockEditorState`].
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -1580,6 +1592,194 @@ impl BlockEditorState {
         };
         self.model.break_coalescing();
         let _ = self.run(EditorCommand::ApplyMark(change), cx);
+        self.model.break_coalescing();
+    }
+
+    /// Snapshot of the link or selection target at the caret, for a host link
+    /// popover. Returns `None` in readonly mode or inside non-linkable blocks
+    /// (such as code blocks).
+    pub fn link_target(&self) -> Option<LinkTarget> {
+        if self.readonly {
+            return None;
+        }
+        let kind = self.model.block_kind_at_caret()?;
+        if kind == BlockKind::CodeBlock {
+            return None;
+        }
+        match &self.model.selection {
+            BlockSelection::Text { anchor, head } if anchor == head => {
+                if let Some((block, range, url)) = self.link_range_at_caret() {
+                    let text = self
+                        .model
+                        .doc
+                        .inline(block)?
+                        .text()
+                        .get(range)?
+                        .to_string();
+                    Some(LinkTarget {
+                        text: Some(text),
+                        url: Some(url),
+                        has_link: true,
+                    })
+                } else {
+                    self.model.doc.inline(head.block)?;
+                    Some(LinkTarget {
+                        text: Some(String::new()),
+                        url: None,
+                        has_link: false,
+                    })
+                }
+            }
+            BlockSelection::Text { anchor, head } if anchor.block == head.block => {
+                let inline = self.model.doc.inline(anchor.block)?;
+                let lo = anchor.offset.min(head.offset);
+                let hi = anchor.offset.max(head.offset);
+                let slice = inline.text().get(lo..hi)?;
+                let text = (!slice.contains(super::inline::ATOM_CHAR)).then(|| slice.to_string());
+                let state = self.model.mark_state(MarkKind::Link);
+                let has_link = state != super::marks::MarkState::Off;
+                let url = (state == super::marks::MarkState::On)
+                    .then(|| {
+                        inline
+                            .mark_after(lo)
+                            .and_then(|m| m.link.as_ref())
+                            .map(|l| l.url.clone())
+                    })
+                    .flatten();
+                Some(LinkTarget {
+                    text,
+                    url,
+                    has_link,
+                })
+            }
+            BlockSelection::Text { .. } => Some(LinkTarget {
+                text: None,
+                url: None,
+                has_link: self.model.mark_state(MarkKind::Link) != super::marks::MarkState::Off,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Insert, update, or remove a link for the current caret or selection in
+    /// one undo step, leaving the caret at the trailing edge of the link.
+    pub fn upsert_link(
+        &mut self,
+        text: Option<&str>,
+        url: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.readonly {
+            return;
+        }
+        let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+            self.set_link(None, cx);
+            return;
+        };
+        let clean_text = text.map(|t| {
+            t.chars()
+                .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+                .collect::<String>()
+        });
+        let trimmed_text = clean_text.as_deref().map(str::trim);
+
+        let (block, range, current_text, is_insert) = match &self.model.selection {
+            BlockSelection::Text { anchor, head } if anchor == head => {
+                if let Some((block, range, _)) = self.link_range_at_caret() {
+                    let existing = self
+                        .model
+                        .doc
+                        .inline(block)
+                        .and_then(|i| i.text().get(range.clone()))
+                        .unwrap_or("")
+                        .to_string();
+                    (block, range, existing, false)
+                } else if self.model.doc.inline(head.block).is_some() {
+                    (head.block, head.offset..head.offset, String::new(), true)
+                } else {
+                    return;
+                }
+            }
+            BlockSelection::Text { anchor, head } if anchor.block == head.block => {
+                let lo = anchor.offset.min(head.offset);
+                let hi = anchor.offset.max(head.offset);
+                let existing = self
+                    .model
+                    .doc
+                    .inline(anchor.block)
+                    .and_then(|i| i.text().get(lo..hi))
+                    .unwrap_or("")
+                    .to_string();
+                (anchor.block, lo..hi, existing, false)
+            }
+            BlockSelection::Text { .. } => {
+                self.set_link(Some(url), cx);
+                return;
+            }
+            _ => return,
+        };
+
+        let change = super::marks::MarkChange::new().with_link(url.to_string(), None);
+        self.end_composition();
+        self.model.break_coalescing();
+        let keep_existing = !is_insert
+            && match clean_text.as_deref() {
+                None => true,
+                Some(t) => !t.trim().is_empty() && t == current_text,
+            };
+        if keep_existing {
+            let end = range.end;
+            self.edit(
+                EditOrigin::Command("set_link"),
+                move |m| {
+                    m.stored_marks = None;
+                    m.transact(EditOrigin::Command("set_link"), |tx| {
+                        let Some(inline) = tx.doc.inline(block) else {
+                            return Ok(None);
+                        };
+                        let mut marked = inline.slice(range.clone());
+                        let len = marked.len();
+                        marked.map_marks(0..len, |mark| change.apply(mark));
+                        if marked != inline.slice(range.clone()) {
+                            tx.replace_text(block, range, marked)?;
+                        }
+                        Ok(Some(BlockSelection::caret(BlockPosition::new(block, end))))
+                    })
+                    .map(|_| ())
+                },
+                cx,
+            );
+        } else {
+            let label = trimmed_text
+                .filter(|t| !t.is_empty())
+                .unwrap_or(url)
+                .to_string();
+            let base = if is_insert {
+                self.model.active_marks().0
+            } else {
+                self.model
+                    .doc
+                    .inline(block)
+                    .and_then(|i| i.mark_after(range.start))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let mark = change.apply(&base);
+            self.edit(
+                EditOrigin::Command("set_link"),
+                move |m| {
+                    m.stored_marks = None;
+                    m.transact(EditOrigin::Command("set_link"), |tx| {
+                        let insert = super::inline::InlineText::plain(&label, mark);
+                        let end = range.start + insert.len();
+                        tx.replace_text(block, range, insert)?;
+                        Ok(Some(BlockSelection::caret(BlockPosition::new(block, end))))
+                    })
+                    .map(|_| ())
+                },
+                cx,
+            );
+        }
         self.model.break_coalescing();
     }
 

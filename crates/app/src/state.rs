@@ -163,7 +163,6 @@ fn sync_flash(quiet: bool, changed: usize) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsMenu {
     CloseBehavior,
-    PullInterval,
 }
 
 /// Result of the settings dialog's "test connection" probe.
@@ -290,6 +289,64 @@ fn debug_log(msg: &str) {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let _ = writeln!(f, "{ms} {msg}");
+    }
+}
+
+/// Link popover input fields, created on first open and reused across notes.
+pub struct LinkInputs {
+    pub text: Entity<InputState>,
+    pub url: Entity<InputState>,
+}
+
+/// Active state of the toolbar hyperlink popover.
+pub struct LinkPopover {
+    pub editor: Entity<BlockEditorState>,
+    pub text_editable: bool,
+    pub has_link: bool,
+    pub error: Option<&'static str>,
+    pub anchor: Point<Pixels>,
+}
+
+pub(crate) fn normalize_link_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('#') || trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return Some(trimmed.to_string());
+    }
+    if let Some((scheme, _)) = trimmed.split_once("://") {
+        if !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        {
+            return Some(trimmed.to_string());
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("mailto:") || lower.starts_with("tel:") {
+        return Some(trimmed.to_string());
+    }
+    Some(format!("https://{trimmed}"))
+}
+
+pub(crate) fn open_note_link(raw: &str, cx: &mut App) {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("tel:")
+    {
+        cx.open_url(trimmed);
+    } else if !trimmed.is_empty()
+        && !trimmed.starts_with('#')
+        && !trimmed.starts_with('/')
+        && !trimmed.starts_with('\\')
+        && !trimmed.contains(':')
+    {
+        cx.open_url(&format!("https://{trimmed}"));
     }
 }
 
@@ -447,6 +504,10 @@ pub struct AppState {
     /// Latest painted bounds of each toolbar button, keyed by element id.
     /// Written from prepaint (no notify) and read when a hover starts.
     pub md_tip_bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    /// Link popover inputs and active anchor state.
+    pub link_inputs: Option<LinkInputs>,
+    pub link_popover: Option<LinkPopover>,
+    pub link_popover_open: bool,
 
     // Settings dialog
     pub settings_page: SettingsPage,
@@ -610,6 +671,9 @@ impl AppState {
             md_tip_closed_at: None,
             md_tip_hover: None,
             md_tip_bounds: Rc::new(RefCell::new(HashMap::new())),
+            link_inputs: None,
+            link_popover: None,
+            link_popover_open: false,
             settings_page: SettingsPage::General,
             settings_page_dir: 1.0,
             settings_page_seq: 0,
@@ -903,6 +967,8 @@ impl AppState {
         self.title_input = None;
         self.last_saved_md = None;
         self.current_stats = (0, 0);
+        self.link_popover_open = false;
+        self.link_popover = None;
     }
 
     pub fn ensure_selection_after_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -927,6 +993,8 @@ impl AppState {
         // leaving. Flush it before its editor is replaced — otherwise the
         // timer fires against the *new* editor and the edit is silently lost.
         self.flush_pending_save(cx);
+        self.link_popover_open = false;
+        self.link_popover = None;
 
         let Some(md) = self.store.note_markdown(id).ok().flatten() else {
             return;
@@ -953,6 +1021,8 @@ impl AppState {
                 BlockEditorEvent::Changed { .. } => this.schedule_save(window, cx),
                 // Keep the formatting bar's active states in sync with the caret.
                 BlockEditorEvent::SelectionChanged => cx.notify(),
+                BlockEditorEvent::EditLinkRequested { .. } => this.open_link_popover(window, cx),
+                BlockEditorEvent::LinkClicked { url } => open_note_link(url, cx),
                 _ => {}
             }
         })
@@ -1557,6 +1627,8 @@ impl AppState {
 
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_settings_inputs(window, cx);
+        self.link_popover_open = false;
+        self.link_popover = None;
         self.show_settings = true;
         self.webdav_test = WebDavTest::Idle;
         self.pending_adopt = None;
@@ -1773,11 +1845,8 @@ impl AppState {
             self.webdav_failed = false;
             self.webdav_next_try = Instant::now();
         } else {
-            // The interval and the delay are greyed out now: neither may be
-            // left half-open underneath, an open list or a caret in the field.
-            if self.settings_menu == Some(SettingsMenu::PullInterval) {
-                self.settings_menu = None;
-            }
+            // The upload delay is greyed out now: it must not keep a caret in
+            // the field underneath while automatic sync is off.
             let delay_focused = self
                 .settings
                 .as_ref()
@@ -2604,15 +2673,14 @@ impl AppState {
         cx.notify();
     }
 
-    /// How long until the next background pull: the user's interval, and at
-    /// least ten minutes while the main window stays hidden in the tray.
+    /// How long until the next silent background check: 5 minutes while the
+    /// main window is visible, 10 minutes while hidden in the tray.
     fn pull_interval_now(&self) -> Duration {
-        let interval = self.config.pull_interval();
         let visible = self.main_hwnd.map(win::is_visible).unwrap_or(true);
         if visible {
-            interval
+            config::PULL_INTERVAL_VISIBLE
         } else {
-            interval.max(Duration::from_secs(600))
+            config::PULL_INTERVAL_TRAY
         }
     }
 
@@ -2673,16 +2741,241 @@ impl AppState {
         cx.notify();
     }
 
-    /// Change how often the background loop checks for other devices'
-    /// changes. The new rhythm starts right away.
-    pub fn set_pull_interval(&mut self, secs: u64, cx: &mut Context<Self>) {
-        self.settings_menu = None;
-        let secs = config::clamp_pull_interval_secs(secs);
-        if self.config.pull_interval_secs != secs {
-            self.config.pull_interval_secs = secs;
-            let _ = self.config.save();
-            self.webdav_next_try = Instant::now();
+    // --- Link popover ---
+
+    fn ensure_link_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link_inputs.is_some() {
+            return;
+        }
+        let text = cx.new(|cx| InputState::new(window, cx).placeholder("链接文字（留空则显示网址）"));
+        let url = cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com"));
+        cx.subscribe_in(&text, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) && this.link_popover_open {
+                let empty_url = this
+                    .link_inputs
+                    .as_ref()
+                    .is_some_and(|i| i.url.read(cx).value().trim().is_empty());
+                if empty_url {
+                    if let Some(i) = &this.link_inputs {
+                        let focus = i.url.read(cx).focus_handle(cx);
+                        window.focus(&focus, cx);
+                    }
+                } else {
+                    this.confirm_link_popover(window, cx);
+                }
+            }
+        })
+        .detach();
+        cx.subscribe_in(&url, window, |this, _, event: &InputEvent, window, cx| {
+            if !this.link_popover_open {
+                return;
+            }
+            match event {
+                InputEvent::PressEnter { .. } => this.confirm_link_popover(window, cx),
+                InputEvent::Change => {
+                    if let Some(p) = &mut this.link_popover {
+                        if p.error.take().is_some() {
+                            cx.notify();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        })
+        .detach();
+        self.link_inputs = Some(LinkInputs { text, url });
+    }
+
+    pub fn open_link_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+        let Some(target) = editor.read(cx).link_target() else {
+            return;
+        };
+        self.md_tip = None;
+        self.md_tip_closed_at = None;
+        self.md_tip_hover = None;
+        self.ensure_link_inputs(window, cx);
+
+        let initial_text = target.text.clone().unwrap_or_default();
+        let initial_url = target
+            .url
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| {
+                let trimmed = initial_text.trim();
+                let lower = trimmed.to_ascii_lowercase();
+                if lower.starts_with("https://") || lower.starts_with("http://") {
+                    trimmed.to_string()
+                } else {
+                    String::new()
+                }
+            });
+
+        let Some(inputs) = &self.link_inputs else {
+            return;
+        };
+        let text_entity = inputs.text.clone();
+        let url_entity = inputs.url.clone();
+        text_entity.update(cx, |s, cx| s.set_value(initial_text.clone(), window, cx));
+        url_entity.update(cx, |s, cx| s.set_value(initial_url, window, cx));
+
+        let anchor = self
+            .md_tip_bounds
+            .borrow()
+            .get("md-link")
+            .copied()
+            .map(|b| point(b.left(), b.bottom()))
+            .unwrap_or_else(|| {
+                let vp = window.viewport_size();
+                point((vp.width - px(360.)).max(px(16.)), px(84.))
+            });
+
+        self.link_popover = Some(LinkPopover {
+            editor,
+            text_editable: target.text.is_some(),
+            has_link: target.has_link,
+            error: None,
+            anchor,
+        });
+        self.link_popover_open = true;
+
+        let focus = if target.text.is_some() && initial_text.trim().is_empty() {
+            text_entity.read(cx).focus_handle(cx)
+        } else {
+            url_entity.read(cx).focus_handle(cx)
+        };
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    pub fn close_link_popover(
+        &mut self,
+        refocus_editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.link_popover_open {
+            return;
+        }
+        self.link_popover_open = false;
+        if refocus_editor {
+            let editor = self
+                .link_popover
+                .as_ref()
+                .map(|p| p.editor.clone())
+                .or_else(|| self.editor.clone());
+            if let Some(editor) = editor {
+                let handle = editor.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
         }
         cx.notify();
+    }
+
+    pub fn confirm_link_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.link_popover_open {
+            return;
+        }
+        let Some((inputs, popover)) = self.link_inputs.as_ref().zip(self.link_popover.as_mut()) else {
+            return;
+        };
+        let raw_text = inputs.text.read(cx).value().to_string();
+        let raw_url = inputs.url.read(cx).value().to_string();
+        let trimmed_url = raw_url.trim();
+        if trimmed_url.is_empty() {
+            if popover.has_link {
+                let editor = popover.editor.clone();
+                editor.update(cx, |e, cx| e.set_link(None, cx));
+                self.close_link_popover(true, window, cx);
+            } else {
+                popover.error = Some("请输入链接地址");
+                let focus = inputs.url.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+                cx.notify();
+            }
+            return;
+        }
+        let Some(normalized) = normalize_link_url(trimmed_url) else {
+            popover.error = Some("请输入链接地址");
+            let focus = inputs.url.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        };
+        let text_editable = popover.text_editable;
+        let editor = popover.editor.clone();
+        editor.update(cx, |e, cx| {
+            e.upsert_link(text_editable.then_some(raw_text.as_str()), Some(&normalized), cx);
+        });
+        self.close_link_popover(true, window, cx);
+    }
+
+    pub fn remove_link_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.link_popover_open {
+            return;
+        }
+        if let Some(editor) = self.link_popover.as_ref().map(|p| p.editor.clone()) {
+            editor.update(cx, |e, cx| e.set_link(None, cx));
+        }
+        self.close_link_popover(true, window, cx);
+    }
+
+    pub(super) fn cycle_link_popover_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((inputs, popover)) = self.link_inputs.as_ref().zip(self.link_popover.as_ref()) else {
+            return;
+        };
+        if !popover.text_editable {
+            let focus = inputs.url.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+            return;
+        }
+        let text_focused = inputs.text.read(cx).focus_handle(cx).is_focused(window);
+        let next = if text_focused {
+            inputs.url.read(cx).focus_handle(cx)
+        } else {
+            inputs.text.read(cx).focus_handle(cx)
+        };
+        window.focus(&next, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_link_url;
+
+    #[test]
+    fn normalize_link_url_adds_https_when_scheme_is_missing() {
+        assert_eq!(normalize_link_url(""), None);
+        assert_eq!(normalize_link_url("   "), None);
+        assert_eq!(
+            normalize_link_url("example.com/docs"),
+            Some("https://example.com/docs".to_string())
+        );
+        assert_eq!(
+            normalize_link_url("  https://rust-lang.org  "),
+            Some("https://rust-lang.org".to_string())
+        );
+        assert_eq!(
+            normalize_link_url("http://localhost:8080"),
+            Some("http://localhost:8080".to_string())
+        );
+        assert_eq!(
+            normalize_link_url("mailto:hi@example.com"),
+            Some("mailto:hi@example.com".to_string())
+        );
+        assert_eq!(
+            normalize_link_url("obsidian://open?vault=notes"),
+            Some("obsidian://open?vault=notes".to_string())
+        );
+        assert_eq!(
+            normalize_link_url("#section"),
+            Some("#section".to_string())
+        );
     }
 }

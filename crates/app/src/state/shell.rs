@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use gpui_kit::*;
 use std::collections::HashMap;
 use std::time::Duration;
-use stickynotes_core::config::{CloseBehavior, WindowPlacement};
+use stickynotes_core::config::{self, CloseBehavior, WindowPlacement};
 use stickynotes_core::shortcuts;
 
 impl AppState {
@@ -202,6 +202,12 @@ impl AppState {
         match (stay, &self.tray, self.main_hwnd) {
             (true, Some(tray), Some(hwnd)) => {
                 win::hide(hwnd);
+                if !self.webdav_failed {
+                    if let Some(last) = self.webdav_last_pass {
+                        self.webdav_next_try =
+                            self.webdav_next_try.max(last + config::PULL_INTERVAL_TRAY);
+                    }
+                }
                 if !self.config.tray_hint_shown {
                     // Once: say where the app went and how to get it back.
                     tray.show_hint();
@@ -218,6 +224,13 @@ impl AppState {
     /// behind other windows).
     pub fn show_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reveal_main(window, cx);
+        if !self.webdav_failed {
+            if let Some(last) = self.webdav_last_pass {
+                self.webdav_next_try = self
+                    .webdav_next_try
+                    .min(last + config::PULL_INTERVAL_VISIBLE);
+            }
+        }
         // Freshen the notes the moment the window is back, not a whole pull
         // interval later.
         self.pull_on_return(window, cx);

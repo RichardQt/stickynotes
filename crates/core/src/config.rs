@@ -15,43 +15,10 @@ pub const DEFAULT_SYNC_DELAY_MS: u64 = 2500;
 pub const MIN_SYNC_DELAY_MS: u64 = 500;
 pub const MAX_SYNC_DELAY_MS: u64 = 600_000;
 
-/// How often the background loop checks the server for other devices'
-/// changes. Returning to the window checks right away, independently of it.
-pub const DEFAULT_PULL_INTERVAL_SECS: u64 = 180;
-pub const MIN_PULL_INTERVAL_SECS: u64 = 60;
-pub const MAX_PULL_INTERVAL_SECS: u64 = 3600;
-/// The intervals the settings dialog offers, in the order it lists them.
-pub const PULL_INTERVAL_CHOICES_SECS: [u64; 4] = [60, 180, 300, 600];
-
-fn default_pull_interval_secs() -> u64 {
-    DEFAULT_PULL_INTERVAL_SECS
-}
-
-fn lenient_pull_interval_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_u64()
-        .filter(|secs| *secs > 0)
-        .map(clamp_pull_interval_secs)
-        .unwrap_or(DEFAULT_PULL_INTERVAL_SECS))
-}
-
-pub fn clamp_pull_interval_secs(secs: u64) -> u64 {
-    secs.clamp(MIN_PULL_INTERVAL_SECS, MAX_PULL_INTERVAL_SECS)
-}
-
-/// An interval as the settings dialog shows and lists it: `1 分钟`, `10 分钟`,
-/// `90 秒` for a value that is not whole minutes.
-pub fn format_pull_interval(secs: u64) -> String {
-    if secs % 60 == 0 {
-        format!("{} 分钟", secs / 60)
-    } else {
-        format!("{secs} 秒")
-    }
-}
+/// How often the background loop silently checks the server for other
+/// devices' changes. Returning to the window still checks right away.
+pub const PULL_INTERVAL_VISIBLE: Duration = Duration::from_secs(300);
+pub const PULL_INTERVAL_TRAY: Duration = Duration::from_secs(600);
 
 fn default_true() -> bool {
     true
@@ -224,13 +191,6 @@ pub struct AppConfig {
     /// Delay between the last edit and the automatic upload, in milliseconds.
     #[serde(default = "default_sync_delay_ms", deserialize_with = "lenient_sync_delay_ms")]
     pub sync_delay_ms: u64,
-    /// How often the background loop checks the server for other devices'
-    /// changes, in seconds.
-    #[serde(
-        default = "default_pull_interval_secs",
-        deserialize_with = "lenient_pull_interval_secs"
-    )]
-    pub pull_interval_secs: u64,
     #[serde(default, deserialize_with = "lenient")]
     pub close_behavior: CloseBehavior,
     /// Order of the note list, within the pinned notes.
@@ -261,7 +221,6 @@ impl Default for AppConfig {
             data_dir: None,
             legacy_migrated: false,
             sync_delay_ms: DEFAULT_SYNC_DELAY_MS,
-            pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
             close_behavior: CloseBehavior::default(),
             note_sort: NoteSort::default(),
             window_bounds: None,
@@ -324,11 +283,6 @@ impl AppConfig {
     /// Delay between the last edit and the automatic upload.
     pub fn sync_delay(&self) -> Duration {
         Duration::from_millis(clamp_sync_delay_ms(self.sync_delay_ms))
-    }
-
-    /// Time between two background checks for other devices' changes.
-    pub fn pull_interval(&self) -> Duration {
-        Duration::from_secs(clamp_pull_interval_secs(self.pull_interval_secs))
     }
 
     /// Folder the note database is kept in.
@@ -509,33 +463,16 @@ mod tests {
     }
 
     #[test]
-    fn the_pull_interval_defaults_to_three_minutes_and_is_kept_in_range() {
-        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.pull_interval(), Duration::from_secs(180));
-        assert_eq!(cfg.pull_interval_secs, DEFAULT_PULL_INTERVAL_SECS);
-
-        let parse = |json: &str| serde_json::from_str::<AppConfig>(json).unwrap().pull_interval_secs;
-        assert_eq!(parse(r#"{"pull_interval_secs":300}"#), 300);
-        assert_eq!(parse(r#"{"pull_interval_secs":0}"#), DEFAULT_PULL_INTERVAL_SECS);
-        assert_eq!(parse(r#"{"pull_interval_secs":-5}"#), DEFAULT_PULL_INTERVAL_SECS);
-        assert_eq!(parse(r#"{"pull_interval_secs":"soon"}"#), DEFAULT_PULL_INTERVAL_SECS);
-        assert_eq!(parse(r#"{"pull_interval_secs":5}"#), MIN_PULL_INTERVAL_SECS);
-        assert_eq!(parse(r#"{"pull_interval_secs":999999}"#), MAX_PULL_INTERVAL_SECS);
-        // A value changed behind the app's back is still clamped when used.
-        let cfg = AppConfig { pull_interval_secs: 60 * 60 * 24, ..AppConfig::default() };
-        assert_eq!(cfg.pull_interval(), Duration::from_secs(MAX_PULL_INTERVAL_SECS));
-    }
-
-    #[test]
-    fn every_offered_pull_interval_is_whole_minutes_and_round_trips() {
-        for secs in PULL_INTERVAL_CHOICES_SECS {
-            assert_eq!(clamp_pull_interval_secs(secs), secs, "{secs}");
-            let shown = format_pull_interval(secs);
-            assert!(shown.ends_with(" 分钟"), "{shown}");
-        }
-        assert_eq!(format_pull_interval(60), "1 分钟");
-        assert_eq!(format_pull_interval(600), "10 分钟");
-        assert_eq!(format_pull_interval(90), "90 秒");
+    fn legacy_pull_interval_field_is_ignored_without_losing_settings() {
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"webdav":{"url":"https://dav.example/","username":"u","password":"p"},
+                "pull_interval_secs":180,"sync_delay_ms":5000}"#,
+        )
+        .unwrap();
+        assert!(cfg.webdav_configured());
+        assert_eq!(cfg.sync_delay_ms, 5000);
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        assert!(!serialized.contains("pull_interval_secs"), "{serialized}");
     }
 
     #[test]

@@ -1951,6 +1951,79 @@ fn d14_cmd_k_requests_popover_and_set_link_edits(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn d14_upsert_link_inserts_edits_and_removes_in_one_undo_step(cx: &mut TestAppContext) {
+    let (editor, cx) = open(cx, "see ");
+    caret_at(&editor, cx, 0, 4);
+    // Collapsed insert with custom label -> [docs](https://x.dev) and caret at end.
+    editor.update(cx, |e, cx| {
+        assert_eq!(
+            e.link_target(),
+            Some(crate::LinkTarget {
+                text: Some(String::new()),
+                url: None,
+                has_link: false,
+            })
+        );
+        e.upsert_link(Some("docs"), Some("https://x.dev"), cx);
+    });
+    assert_eq!(source(&editor, cx).trim_end(), "see [docs](https://x.dev)");
+    // Typing right after the inserted link does not extend the link mark.
+    ime_type(&editor, cx, " now");
+    assert_eq!(
+        source(&editor, cx).trim_end(),
+        "see [docs](https://x.dev) now"
+    );
+    // Caret inside existing link reads text+url, updates both in one undo step.
+    caret_at(&editor, cx, 0, 6);
+    editor.update(cx, |e, cx| {
+        assert_eq!(
+            e.link_target(),
+            Some(crate::LinkTarget {
+                text: Some("docs".to_string()),
+                url: Some("https://x.dev".into()),
+                has_link: true,
+            })
+        );
+        e.upsert_link(Some("guide"), Some("https://y.dev"), cx);
+    });
+    assert_eq!(
+        source(&editor, cx).trim_end(),
+        "see [guide](https://y.dev) now"
+    );
+    keys(cx, &format!("{M}-z"));
+    assert_eq!(
+        source(&editor, cx).trim_end(),
+        "see [docs](https://x.dev) now"
+    );
+}
+
+#[gpui::test]
+fn d14_upsert_link_autolink_and_nested_marks(cx: &mut TestAppContext) {
+    // Collapsed insert with empty label uses URL as text (autolink).
+    {
+        let (editor, cx) = open(cx, "visit ");
+        caret_at(&editor, cx, 0, 6);
+        editor.update(cx, |e, cx| {
+            e.upsert_link(Some(""), Some("https://rust-lang.org"), cx);
+        });
+        assert_eq!(
+            source(&editor, cx).trim_end(),
+            "visit <https://rust-lang.org>"
+        );
+    }
+    // Updating only the URL on a link with nested marks preserves inner formatting.
+    let (editor, cx) = open(cx, "[**bold** text](https://a.dev)");
+    caret_at(&editor, cx, 0, 2);
+    editor.update(cx, |e, cx| {
+        e.upsert_link(Some("bold text"), Some("https://b.dev"), cx);
+    });
+    assert_eq!(
+        source(&editor, cx).trim_end(),
+        "[**bold** text](https://b.dev)"
+    );
+}
+
+#[gpui::test]
 fn d14_toolbar_task_toggle(cx: &mut TestAppContext) {
     // The story's Task button runs `EditorCommand::ToggleTask`.
     let (editor, cx) = open(cx, "- a");

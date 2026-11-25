@@ -1,3 +1,4 @@
+use crate::settings_ui::{field_ring, ACCENT, DANGER, ERROR_INK};
 use crate::state::{md_command, AppState, MdTip, SyncStatus, ThemeSpec, THEMES};
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::animation::{cubic_bezier, ease_out_cubic};
@@ -424,6 +425,19 @@ impl Render for AppState {
                 md_tip_overlay(tip, keys, tip_presence.progress, window, cx)
             });
 
+        let link_transition = if self.link_popover_open {
+            Transition::new(Duration::from_millis(165)).ease(cubic_bezier(0.16, 1.0, 0.3, 1.0))
+        } else {
+            Transition::new(Duration::from_millis(115)).ease(ease_out_cubic)
+        };
+        let link_presence = Presence::new("link-popover", self.link_popover_open)
+            .transition(link_transition)
+            .sample(window, cx);
+        let link_popover = link_presence
+            .should_render()
+            .then(|| self.render_link_popover(link_presence.progress, window, cx))
+            .flatten();
+
         let settings_transition = if self.show_settings {
             Transition::new(Duration::from_millis(245)).ease(cubic_bezier(0.16, 1.0, 0.3, 1.0))
         } else {
@@ -497,6 +511,7 @@ impl Render for AppState {
             // Hover hint for the markdown bar, painted last so it floats over
             // the title below the toolbar.
             .when_some(tip_overlay, |el, overlay| el.child(overlay))
+            .when_some(link_popover, |el, popover| el.child(popover))
             .when_some(settings_modal, |el, modal| el.child(modal))
             .when_some(confirm_modal, |el, modal| el.child(modal))
             .when_some(quick_overlay, |el, overlay| el.child(overlay))
@@ -563,7 +578,7 @@ fn list_state(model: &BlockEditorModel) -> (bool, bool, bool) {
     (false, false, false)
 }
 
-/// One icon button of the markdown toolbar: a 24×24 transparent square that
+/// One icon button of the markdown toolbar: a 22×22 transparent circle that
 /// only ever paints translucent ink, so it blends into any paper colour.
 /// Its painted bounds are recorded so the hover hint can sit under it.
 #[allow(clippy::too_many_arguments)]
@@ -600,7 +615,7 @@ fn md_tb_icon(
         .group(id)
         .role(Role::Button)
         .aria_label(label)
-        .size(px(23.))
+        .size(px(22.))
         .flex_none()
         .flex()
         .items_center()
@@ -624,7 +639,7 @@ fn md_tb_icon(
                 .when(enabled, |el| {
                     el.group_hover(id, move |s| s.text_color(fg_hover))
                 })
-                .child(Icon::new(icon).size(px(14.5))),
+                .child(Icon::new(icon).size(px(14.))),
         )
         .on_prepaint(move |b, _, _| {
             bounds.borrow_mut().insert(id, b);
@@ -2229,7 +2244,7 @@ impl AppState {
             .child(palette)
     }
 
-    /// Flat, single-row markdown bar: every high-frequency format is a 23×23
+    /// Flat, single-row markdown bar: every high-frequency format is a 22×22
     /// icon button with a hover hint. Borderless translucent iOS material lets
     /// the note's paper colour breathe through without any dark perimeter line.
     fn render_md_toolbar(
@@ -2240,9 +2255,21 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // Below this width the full row no longer fits beside the palette
-        // capsule (measured at the minimum window size).
-        let narrow = window.viewport_size().width < px(1080.);
-        let (kind, in_code_block, bold, italic, strike, code, highlight, in_quote) = {
+        // capsule (measured against the 412 px full bar + 141 px palette).
+        let narrow = window.viewport_size().width < px(1095.);
+        let (
+            kind,
+            in_code_block,
+            bold,
+            italic,
+            underline,
+            strike,
+            code,
+            highlight,
+            link,
+            can_link,
+            in_quote,
+        ) = {
             let e = editor.read(cx);
             let m = e.model();
             let kind = e.block_kind_at_caret();
@@ -2251,9 +2278,12 @@ impl AppState {
                 kind == Some(BlockKind::CodeBlock),
                 m.mark_state(MarkKind::Bold) == MarkState::On,
                 m.mark_state(MarkKind::Italic) == MarkState::On,
+                m.mark_state(MarkKind::Underline) == MarkState::On,
                 m.mark_state(MarkKind::Strikethrough) == MarkState::On,
                 m.mark_state(MarkKind::Code) == MarkState::On,
                 m.mark_state(MarkKind::Highlight) == MarkState::On,
+                m.mark_state(MarkKind::Link) != MarkState::Off || e.link_at_caret().is_some(),
+                e.link_target().is_some(),
                 m.in_blockquote(),
             )
         };
@@ -2350,6 +2380,25 @@ impl AppState {
             }
         };
 
+        let link_label = shortcuts::action_def(shortcuts::MD_LINK)
+            .map(|def| def.label)
+            .unwrap_or("超链接");
+        let link_app = app.clone();
+        let link_btn = md_tb_icon(
+            "md-link",
+            link_label,
+            AssetIconName::Link,
+            link,
+            can_link,
+            bounds.clone(),
+            hover_for("md-link", link_label, shortcuts::MD_LINK),
+            move |_, window, cx| {
+                link_app.update(cx, |this, cx| this.open_link_popover(window, cx));
+            },
+            window,
+            cx,
+        );
+
         // Every button is one of the formatting actions of the shortcut
         // settings. The action decides what the button does and whether that
         // applies at the caret — exactly as its shortcut would — and gives
@@ -2372,9 +2421,9 @@ impl AppState {
                 cx,
             )
         };
-        let sep = || div().w(px(1.)).h(px(12.)).mx(px(2.)).flex_none().bg(sep_bg);
+        let sep = || div().w(px(1.)).h(px(12.)).mx(px(1.5)).flex_none().bg(sep_bg);
 
-        let mut row = h_flex().h_full().flex_none().items_center().gap(px(1.));
+        let mut row = h_flex().h_full().flex_none().items_center();
         // 1. Heading level.
         row = row.child(btn(
             "md-para",
@@ -2415,6 +2464,12 @@ impl AppState {
             shortcuts::MD_ITALIC,
         ));
         row = row.child(btn(
+            "md-underline",
+            AssetIconName::Underline,
+            underline,
+            shortcuts::MD_UNDERLINE,
+        ));
+        row = row.child(btn(
             "md-strike",
             AssetIconName::Strikethrough,
             strike,
@@ -2432,6 +2487,7 @@ impl AppState {
             highlight,
             shortcuts::MD_HIGHLIGHT,
         ));
+        row = row.child(link_btn);
         row = row.child(sep());
         // 3. Lists and block structure.
         row = row.child(btn(
@@ -2488,7 +2544,7 @@ impl AppState {
         h_flex()
             .min_w_0()
             .h(px(30.))
-            .px(px(5.))
+            .px(px(4.))
             .items_center()
             .rounded(px(9999.))
             .bg(paper_capsule_bg(is_white_paper))
@@ -2991,6 +3047,292 @@ impl AppState {
             .child(header)
             .child(editor_content)
             .child(footer)
+    }
+
+    /// Floating popover anchored below the toolbar Link button (`[text](url)`).
+    fn render_link_popover(
+        &self,
+        progress: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let popover = self.link_popover.as_ref()?;
+        let inputs = self.link_inputs.as_ref()?;
+        let progress = progress.clamp(0., 1.);
+        let reduce_motion = cx.reduce_motion();
+        let vp = window.viewport_size();
+        let card_w = px(320.);
+        let left = popover.anchor.x.min(vp.width - card_w - px(16.)).max(px(16.));
+        let base_top = (popover.anchor.y + px(6.))
+            .min(vp.height - px(260.))
+            .max(TITLEBAR_H + px(4.));
+        let rel_top = base_top - TITLEBAR_H
+            + px(if reduce_motion {
+                0.
+            } else {
+                (1. - progress) * -5.
+            });
+
+        let text_focused = inputs.text.read(cx).focus_handle(cx).is_focused(window);
+        let url_focused = inputs.url.read(cx).focus_handle(cx).is_focused(window);
+        let url_err = popover.error;
+
+        let mut card = v_flex()
+            .id("link-popover-card")
+            .absolute()
+            .left(left)
+            .top(rel_top)
+            .w(card_w)
+            .p(px(14.))
+            .gap(px(10.))
+            .opacity(progress)
+            .rounded(px(14.))
+            .bg(rgb(0xFFFFFF))
+            .border_1()
+            .border_color(hsla(220. / 360., 0.20, 0.16, 0.10))
+            .shadow(modal_surface_shadow_faded(progress))
+            .when(self.link_popover_open, |el| {
+                el.occlude().on_click(|_, _, cx| cx.stop_propagation())
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                Icon::new(AssetIconName::Link)
+                                    .size(px(13.5))
+                                    .flex_none()
+                                    .text_color(rgb(ACCENT)),
+                            )
+                            .child(
+                                Label::new(if popover.has_link {
+                                    "编辑超链接"
+                                } else {
+                                    "插入超链接"
+                                })
+                                .id("link-popover-title")
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(INK_PRIMARY)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("link-popover-close")
+                            .size(px(22.))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .text_color(rgb(INK_MUTED))
+                            .hover(|s| s.bg(shell_hover()).text_color(rgb(INK_PRIMARY)))
+                            .active(|s| s.bg(shell_active()))
+                            .child(Icon::new(IconName::Close).size(px(12.)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_link_popover(true, window, cx);
+                            })),
+                    ),
+            );
+
+        if popover.text_editable {
+            card = card.child(
+                v_flex()
+                    .id("link-popover-text-field")
+                    .gap(px(4.))
+                    .child(
+                        Label::new("显示文本")
+                            .id("link-popover-text-label")
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(if text_focused {
+                                ACCENT
+                            } else {
+                                INK_SECONDARY
+                            })),
+                    )
+                    .child(
+                        div()
+                            .h(px(32.))
+                            .px(px(3.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(9.))
+                            .bg(rgb(0xFFFFFF))
+                            .border_1()
+                            .border_color(if text_focused {
+                                rgb(ACCENT).into()
+                            } else {
+                                field_border_color()
+                            })
+                            .shadow(if text_focused {
+                                field_ring(ACCENT)
+                            } else {
+                                ios_field_shadow()
+                            })
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&inputs.text)
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .focus_bordered(false),
+                                ),
+                            ),
+                    ),
+            );
+        }
+
+        card = card
+            .child(
+                v_flex()
+                    .id("link-popover-url-field")
+                    .gap(px(4.))
+                    .child(
+                        Label::new("链接地址")
+                            .id("link-popover-url-label")
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(if url_err.is_some() {
+                                ERROR_INK
+                            } else if url_focused {
+                                ACCENT
+                            } else {
+                                INK_SECONDARY
+                            })),
+                    )
+                    .child(
+                        div()
+                            .h(px(32.))
+                            .px(px(3.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(9.))
+                            .bg(rgb(0xFFFFFF))
+                            .border_1()
+                            .border_color(if url_err.is_some() {
+                                rgb(DANGER).into()
+                            } else if url_focused {
+                                rgb(ACCENT).into()
+                            } else {
+                                field_border_color()
+                            })
+                            .shadow(if url_err.is_some() {
+                                field_ring(DANGER)
+                            } else if url_focused {
+                                field_ring(ACCENT)
+                            } else {
+                                ios_field_shadow()
+                            })
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&inputs.url)
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .focus_bordered(false),
+                                ),
+                            ),
+                    )
+                    .when_some(url_err, |el, message| {
+                        el.child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .child(
+                                    Icon::new(AssetIconName::CircleAlert)
+                                        .size(px(11.5))
+                                        .flex_none()
+                                        .text_color(rgb(ERROR_INK)),
+                                )
+                                .child(
+                                    Label::new(message)
+                                        .id("link-popover-error")
+                                        .text_size(px(11.))
+                                        .text_color(rgb(ERROR_INK)),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                Label::new("按住 Ctrl 点击链接即可在浏览器中打开")
+                    .id("link-popover-hint")
+                    .text_size(px(10.5))
+                    .text_color(rgb(INK_MUTED)),
+            )
+            .child(
+                h_flex()
+                    .pt(px(2.))
+                    .items_center()
+                    .gap(px(6.))
+                    .when(popover.has_link, |el| {
+                        el.child(
+                            h_flex()
+                                .id("btn-link-remove")
+                                .h(px(28.))
+                                .px(px(10.))
+                                .gap(px(4.))
+                                .flex_none()
+                                .items_center()
+                                .rounded(px(9999.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(hsla(358. / 360., 0.70, 0.55, 0.08)))
+                                .active(|s| s.bg(hsla(358. / 360., 0.70, 0.55, 0.14)))
+                                .child(
+                                    Icon::new(AssetIconName::Unlink)
+                                        .size(px(12.))
+                                        .flex_none()
+                                        .text_color(rgb(ERROR_INK)),
+                                )
+                                .child(
+                                    Label::new("移除链接")
+                                        .id("btn-link-remove-label")
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(ERROR_INK)),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.remove_link_popover(window, cx);
+                                })),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        secondary_pill("btn-link-cancel", "取消", true)
+                            .h(px(28.))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_link_popover(true, window, cx);
+                            })),
+                    )
+                    .child(
+                        primary_pill("btn-link-confirm", "确定")
+                            .h(px(28.))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_link_popover(window, cx);
+                            })),
+                    ),
+            );
+
+        Some(
+            div()
+                .id("link-popover-shield")
+                .absolute()
+                .top(TITLEBAR_H)
+                .left(px(0.))
+                .right(px(0.))
+                .bottom(px(0.))
+                .when(self.link_popover_open, |el| {
+                    el.occlude().on_click(cx.listener(|this, _, window, cx| {
+                        this.close_link_popover(true, window, cx);
+                    }))
+                })
+                .child(card)
+                .into_any_element(),
+        )
     }
 }
 

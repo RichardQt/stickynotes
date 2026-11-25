@@ -24,6 +24,9 @@ pub(crate) fn md_command(action: &str, kind: Option<BlockKind>) -> Option<Editor
         shortcuts::MD_H3 => styles_text.then(|| heading(3)),
         shortcuts::MD_BOLD => styles_text.then_some(EditorCommand::ToggleMark(MarkKind::Bold)),
         shortcuts::MD_ITALIC => styles_text.then_some(EditorCommand::ToggleMark(MarkKind::Italic)),
+        shortcuts::MD_UNDERLINE => {
+            styles_text.then_some(EditorCommand::ToggleMark(MarkKind::Underline))
+        }
         shortcuts::MD_STRIKE => {
             styles_text.then_some(EditorCommand::ToggleMark(MarkKind::Strikethrough))
         }
@@ -66,7 +69,7 @@ fn is_editor_builtin(combo: &shortcuts::Combo) -> bool {
     if combo.alt {
         combo.key() == "0"
     } else {
-        matches!(combo.key(), "b" | "i" | "e")
+        matches!(combo.key(), "b" | "i" | "e" | "k")
     }
 }
 
@@ -126,6 +129,25 @@ impl AppState {
         }
         if self.quick_overlay_open {
             self.on_quick_keystroke(event, plain, ctrl_only, &combo, cx);
+            return;
+        }
+        if self.link_popover_open {
+            if plain && key == "escape" {
+                cx.stop_propagation();
+                self.close_link_popover(true, window, cx);
+            } else if key == "tab"
+                && !(held.control || held.alt || held.platform || held.function)
+            {
+                cx.stop_propagation();
+                self.cycle_link_popover_focus(window, cx);
+            } else if self
+                .keymap
+                .action_for(&combo)
+                .is_some_and(|a| a.id == shortcuts::MD_LINK)
+            {
+                cx.stop_propagation();
+                self.close_link_popover(true, window, cx);
+            }
             return;
         }
         // AltGr on some keyboard layouts is Ctrl+Alt: a key that types a
@@ -208,7 +230,11 @@ impl AppState {
             Group::Markdown => {
                 if let Some(editor) = body {
                     cx.stop_propagation();
-                    run_md_action(&editor, action.id, cx);
+                    if action.id == shortcuts::MD_LINK {
+                        self.open_link_popover(window, cx);
+                    } else {
+                        run_md_action(&editor, action.id, cx);
+                    }
                 }
             }
         }
@@ -359,5 +385,36 @@ impl AppState {
         if let Err(e) = self.config.save() {
             self.status = SyncStatus::Error(format!("保存设置失败：{e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_editor_builtin, md_command};
+    use markdown_editor::{BlockKind, EditorCommand, MarkKind};
+    use stickynotes_core::shortcuts;
+
+    #[test]
+    fn underline_maps_to_toggle_mark_outside_code_blocks() {
+        assert_eq!(
+            md_command(shortcuts::MD_UNDERLINE, Some(BlockKind::Paragraph)),
+            Some(EditorCommand::ToggleMark(MarkKind::Underline))
+        );
+        assert_eq!(
+            md_command(shortcuts::MD_UNDERLINE, Some(BlockKind::Heading { level: 2 })),
+            Some(EditorCommand::ToggleMark(MarkKind::Underline))
+        );
+        assert_eq!(
+            md_command(shortcuts::MD_UNDERLINE, Some(BlockKind::CodeBlock)),
+            None
+        );
+        assert_eq!(md_command(shortcuts::MD_UNDERLINE, None), None);
+    }
+
+    #[test]
+    fn editor_builtin_blocks_ctrl_k_when_unmapped() {
+        assert!(is_editor_builtin(&shortcuts::Combo::parse("Ctrl+K").unwrap()));
+        assert!(is_editor_builtin(&shortcuts::Combo::parse("Ctrl+B").unwrap()));
+        assert!(!is_editor_builtin(&shortcuts::Combo::parse("Ctrl+U").unwrap()));
     }
 }
