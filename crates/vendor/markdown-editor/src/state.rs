@@ -233,14 +233,21 @@ pub(crate) fn init(cx: &mut App) {
 }
 
 /// Clipboard metadata that marks a copy as the editor's own inline Markdown
-/// (D17). Paste parses tagged text as inline Markdown; untagged text keeps
-/// the conservative import.
-pub(crate) const COPY_TAG: &str = "gpui-kit/block-editor/inline-markdown/v1";
+/// (D17). The metadata is the tag, a newline, then the Markdown that restores
+/// the marks. The visible clipboard text is plain text, so other apps see no
+/// markers or escapes. Untagged text keeps the conservative import.
+pub(crate) const COPY_TAG: &str = "gpui-kit/block-editor/inline-markdown/v2";
 
-/// Clipboard metadata for a copy of several blocks, written as Markdown
-/// (headings, lists, quotes, code, tables, tasks and marks). Paste parses it
-/// back into blocks.
-pub(crate) const BLOCKS_COPY_TAG: &str = "gpui-kit/block-editor/blocks-markdown/v1";
+/// Clipboard metadata for a copy of several blocks (D18), written as
+/// Markdown in the same `tag\nmarkdown` form: headings, lists, quotes, code,
+/// tables, tasks and marks. Paste parses it back into blocks.
+pub(crate) const BLOCKS_COPY_TAG: &str = "gpui-kit/block-editor/blocks-markdown/v2";
+
+/// The v1 forms, where the tag was the whole metadata and the visible text
+/// was the Markdown. A copy made before the plain-text payload still pastes
+/// with its marks.
+const LEGACY_COPY_TAG: &str = "gpui-kit/block-editor/inline-markdown/v1";
+const LEGACY_BLOCKS_COPY_TAG: &str = "gpui-kit/block-editor/blocks-markdown/v1";
 
 /// What the clipboard item says about where it came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,12 +261,35 @@ pub(crate) enum CopyKind {
 }
 
 impl CopyKind {
-    fn of(item: &ClipboardItem) -> Self {
-        match item.metadata() {
-            Some(m) if m == COPY_TAG => Self::Inline,
-            Some(m) if m == BLOCKS_COPY_TAG => Self::Blocks,
-            _ => Self::External,
+    /// The kind and the Markdown that restores this copy, if the item is one
+    /// of ours. `None` for external text.
+    fn own_copy(item: &ClipboardItem) -> Option<(Self, Option<&str>)> {
+        let metadata = item.metadata()?;
+        for (tag, kind) in [
+            (COPY_TAG, Self::Inline),
+            (BLOCKS_COPY_TAG, Self::Blocks),
+            (LEGACY_COPY_TAG, Self::Inline),
+            (LEGACY_BLOCKS_COPY_TAG, Self::Blocks),
+        ] {
+            if metadata == tag {
+                return Some((kind, None));
+            }
+            if let Some(markdown) = metadata.strip_prefix(tag).and_then(|m| m.strip_prefix('\n')) {
+                return Some((kind, Some(markdown)));
+            }
         }
+        None
+    }
+
+    /// The editor's own Markdown for this item, when it is one of ours. A v1
+    /// copy keeps its Markdown in the visible text.
+    fn own_markdown(item: &ClipboardItem) -> Option<(Self, SharedString)> {
+        let (kind, markdown) = Self::own_copy(item)?;
+        let markdown = match markdown {
+            Some(markdown) => SharedString::from(markdown),
+            None => SharedString::from(item.text()?),
+        };
+        Some((kind, markdown))
     }
 
     fn tag(self) -> Option<&'static str> {
@@ -351,7 +381,21 @@ pub struct PasteRequest {
     plain: bool,
     /// Where the item came from (the editor's own tagged copies, D17).
     copy: CopyKind,
+    /// The editor's own Markdown for the item: the metadata payload, or the
+    /// visible text of a legacy v1 copy. `None` for external text.
+    markdown: Option<SharedString>,
+    /// The visible clipboard text the host sees, so `apply_paste` can tell
+    /// "passed back unchanged" from "the host rewrote it".
+    visible: Option<SharedString>,
     sequence: u64,
+}
+
+impl PasteRequest {
+    /// Cmd/Ctrl+Shift+V: the user asked for plain text, so the host should
+    /// resolve it with text only (no pictures or other admissions).
+    pub fn is_plain(&self) -> bool {
+        self.plain
+    }
 }
 
 /// D22: a press on a top-level block's handle. It becomes a reorder drag
@@ -2090,56 +2134,63 @@ impl BlockEditorState {
         let _ = self.run(EditorCommand::ToggleMark(kind), cx);
     }
 
-    /// The selection as clipboard text, and whether it is the editor's own
-    /// inline Markdown (D17): then the copy is tagged with
-    /// [`COPY_TAG`] so paste parses it back.
-    fn selected_text(&self) -> (String, CopyKind) {
-        if let Some(table) = self.model.cells_markdown() {
-            return (table, CopyKind::Blocks);
+    /// The selection for the clipboard: the plain text other apps see, the
+    /// editor's own Markdown that restores marks and structure on paste, and
+    /// whether it is one of our own copies (D17/D18).
+    fn selected_text(&self) -> (String, String, CopyKind) {
+        if let Some(markdown) = self.model.cells_markdown() {
+            let plain = self.model.cells_plain_text().unwrap_or_default();
+            return (plain, markdown, CopyKind::Blocks);
         }
         if let Some((parent, range)) = self.model.selected_blocks() {
             let ids = &self.model.doc.children(parent)[range];
             return (
+                super::serialize::join_blocks_plain(&self.model.doc, ids),
                 super::serialize::join_blocks(&self.model.doc, ids),
                 CopyKind::Blocks,
             );
         }
         let Ok(range) = self.model.doc.resolve_selection(self.model.selection()) else {
-            return (String::new(), CopyKind::External);
+            return (String::new(), String::new(), CopyKind::External);
         };
         // Several blocks: Markdown for the whole selection (D18).
         if range.start.block != range.end.block
             && let Some(markdown) = super::slice::selection_markdown(&self.model.doc, range)
         {
-            return (markdown, CopyKind::Blocks);
+            let plain =
+                super::slice::selection_plain_text(&self.model.doc, range).unwrap_or_default();
+            return (plain, markdown, CopyKind::Blocks);
         }
         let mut inline_only = true;
-        let text = self
-            .model
-            .text_ranges(range)
-            .into_iter()
-            .filter_map(|(id, lo, hi)| {
-                // Marks and inline atoms copy as Markdown (an image as
-                // `![alt](url)`, never the U+FFFC placeholder, #3113). A
-                // partial selection serializes as its own inline, so
-                // delimiters are always balanced at the cut edges.
-                if let Some(inline) = self.model.doc.inline(id) {
-                    return Some(super::serialize::inline_markdown(&inline.slice(lo..hi)));
-                }
-                inline_only = false;
-                let text = self.model.doc.leaf_text(id)?;
-                text.get(lo..hi).map(str::to_string)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        (
-            text,
-            if inline_only {
-                CopyKind::Inline
-            } else {
-                CopyKind::External
-            },
-        )
+        let mut plain = Vec::new();
+        let mut markdown = Vec::new();
+        for (id, lo, hi) in self.model.text_ranges(range) {
+            // Marks and inline atoms copy as Markdown (an image as
+            // `![alt](url)`, never the U+FFFC placeholder, #3113). A partial
+            // selection serializes as its own inline, so delimiters are
+            // always balanced at the cut edges.
+            if let Some(inline) = self.model.doc.inline(id) {
+                let slice = inline.slice(lo..hi);
+                plain.push(super::serialize::inline_plain(&slice));
+                markdown.push(super::serialize::inline_markdown(&slice));
+                continue;
+            }
+            inline_only = false;
+            let text = self
+                .model
+                .doc
+                .leaf_text(id)
+                .and_then(|text| text.get(lo..hi))
+                .unwrap_or_default();
+            plain.push(text.to_string());
+            markdown.push(text.to_string());
+        }
+        let kind = if inline_only {
+            CopyKind::Inline
+        } else {
+            CopyKind::External
+        };
+        (plain.join("\n"), markdown.join("\n"), kind)
     }
 
     // ---- action handlers --------------------------------------------------
@@ -2514,13 +2565,18 @@ impl BlockEditorState {
         let _ = self.run(EditorCommand::Outdent, cx);
     }
     pub(crate) fn on_copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        let (text, kind) = self.selected_text();
-        if text.is_empty() {
+        let (plain, markdown, kind) = self.selected_text();
+        if plain.is_empty() && markdown.is_empty() {
             return;
         }
         cx.write_to_clipboard(match kind.tag() {
-            Some(tag) => ClipboardItem::new_string_with_metadata(text, tag.to_string()),
-            None => ClipboardItem::new_string(text),
+            // The visible text stays readable; the Markdown is only for our
+            // own paste (D17/D18).
+            Some(tag) => ClipboardItem::new_string_with_metadata(
+                plain,
+                format!("{tag}\n{markdown}"),
+            ),
+            None => ClipboardItem::new_string(plain),
         });
     }
     pub(crate) fn on_cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
@@ -2571,18 +2627,32 @@ impl BlockEditorState {
             return;
         }
         self.end_composition();
+        let own = CopyKind::own_markdown(&item);
+        let copy = own
+            .as_ref()
+            .map(|(kind, _)| *kind)
+            .unwrap_or(CopyKind::External);
         if self.clipboard_policy == ClipboardPolicy::Host {
             self.paste_sequence += 1;
             self.pending_paste = Some(self.paste_sequence);
             let request = PasteRequest {
                 range: self.model.capture(self.model.selection.clone()),
                 plain,
-                copy: CopyKind::of(&item),
+                copy,
+                markdown: own.map(|(_, markdown)| markdown),
+                visible: item.text().map(SharedString::from),
                 sequence: self.paste_sequence,
             };
             cx.emit(BlockEditorEvent::PasteRequested { request, item });
+        } else if plain {
+            // Cmd/Ctrl+Shift+V: the visible text, under no Markdown import.
+            if let Some(text) = item.text() {
+                self.paste_text(&text, true, copy, cx);
+            }
+        } else if let Some((_, markdown)) = own {
+            self.paste_text(&markdown, false, copy, cx);
         } else if let Some(text) = item.text() {
-            self.paste_text(&text, plain, CopyKind::of(&item), cx);
+            self.paste_text(&text, false, CopyKind::External, cx);
         }
     }
 
@@ -2604,11 +2674,85 @@ impl BlockEditorState {
             return false;
         }
         self.pending_paste = None;
-        if let Some(text) = text {
-            self.paste_text(text, request.plain, request.copy, cx);
+        let Some(text) = text else {
+            return true;
+        };
+        if request.plain {
+            self.paste_text(text, true, request.copy, cx);
+        } else if let Some(markdown) = &request.markdown {
+            // A faithful host passes the visible clipboard text back
+            // unchanged, so paste restores the copy's marks and structure.
+            // Anything else — filtered, rewritten or partial — is the host's
+            // own text, pasted without the editor's private source. For a
+            // legacy v1 copy the Markdown *was* the visible text, so an
+            // unchanged return matches either way.
+            let unchanged = request.visible.as_deref() == Some(text) || text == markdown.as_ref();
+            if unchanged {
+                self.paste_text(markdown, false, request.copy, cx);
+            } else {
+                self.paste_text(text, false, CopyKind::External, cx);
+            }
+        } else {
+            self.paste_text(text, false, request.copy, cx);
         }
         true
     }
+
+    /// Resolve an intercepted paste with inline Markdown the host made
+    /// itself, such as a picture it admitted as a `data:` URL
+    /// (`![alt](data:image/png;base64,…)`). Each line is parsed like the
+    /// editor's own copies (D17), so a picture becomes an image atom in a
+    /// paragraph, heading or table cell (where several lines are joined into
+    /// one); one undo step. A code block cannot hold an image: nothing is
+    /// inserted and `false` is returned, as for a stale request; check
+    /// [`Self::is_paste_current`] first to tell the two apart.
+    pub fn apply_paste_markdown(
+        &mut self,
+        request: &PasteRequest,
+        markdown: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_paste_current(request) {
+            return false;
+        }
+        self.pending_paste = None;
+        if self.selection_starts_in_code() {
+            return false;
+        }
+        let mut inserted = false;
+        self.edit(
+            EditOrigin::Paste,
+            |model| {
+                inserted = model.paste_inline_markdown(markdown)?;
+                if !inserted {
+                    // A table cell takes a single line.
+                    let line = markdown
+                        .split('\n')
+                        .filter(|line| !line.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    inserted = model.paste_inline_markdown(&line)?;
+                }
+                Ok(())
+            },
+            cx,
+        );
+        inserted
+    }
+
+    /// The selection is a caret or text range that starts in a code block.
+    /// Whole-block and cell selections are replaced by a paste, wherever
+    /// they are.
+    fn selection_starts_in_code(&self) -> bool {
+        if self.model.selected_blocks().is_some() || self.model.selected_cells().is_some() {
+            return false;
+        }
+        self.model
+            .doc
+            .resolve_selection(self.model.selection())
+            .is_ok_and(|range| self.model.doc.plain(range.start.block).is_some())
+    }
+
     fn paste_text(&mut self, text: &str, plain: bool, copy: CopyKind, cx: &mut Context<Self>) {
         self.edit(
             EditOrigin::Paste,

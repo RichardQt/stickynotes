@@ -6,7 +6,7 @@
 //! reaches through [`request`].
 
 use crate::state::{get_theme, AppState};
-use crate::ui::{app_logo, ink, primary_pill, INK_MUTED, INK_PRIMARY, INK_SECONDARY};
+use crate::ui::{app_logo, ink, note_editor, primary_pill, INK_MUTED, INK_PRIMARY, INK_SECONDARY};
 use crate::win;
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::animation::cubic_bezier;
@@ -15,8 +15,9 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::Icon;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use markdown_editor::component::BlockEditor;
-use markdown_editor::{BlockEditorEvent, BlockEditorState, BlockEditorStyle, SubmitPolicy};
+use markdown_editor::{
+    BlockEditorEvent, BlockEditorState, BlockEditorStyle, ClipboardPolicy, SubmitPolicy,
+};
 use std::time::Duration;
 
 /// Size of the quick note, as a window and as a card.
@@ -125,9 +126,11 @@ impl QuickNote {
     ) -> Self {
         let scroll = ScrollHandle::new();
         let editor = cx.new(|cx| {
-            // Enter finishes the note; Shift+Enter starts a new line.
-            let mut state =
-                BlockEditorState::new(window, cx).with_submit_policy(SubmitPolicy::Enter);
+            // Enter finishes the note; Shift+Enter starts a new line. Pastes
+            // come to `crate::paste`, which also takes pictures.
+            let mut state = BlockEditorState::new(window, cx)
+                .with_submit_policy(SubmitPolicy::Enter)
+                .with_clipboard_policy(ClipboardPolicy::Host);
             state.set_scroll_handle(scroll.clone());
             state.set_editor_style(
                 BlockEditorStyle::default()
@@ -148,6 +151,24 @@ impl QuickNote {
             // Enter. While an input method is composing, the editor keeps
             // the key for the candidate and never gets here.
             BlockEditorEvent::SubmitRequested => this.request(QuickAction::Close, cx),
+            BlockEditorEvent::PasteRequested { request, item } => {
+                let view = cx.weak_entity();
+                crate::paste::resolve(
+                    &editor,
+                    request,
+                    item,
+                    move |outcome, cx| {
+                        // A picture that made it in is saved like typing;
+                        // only one that did not needs saying.
+                        if let crate::paste::Outcome::Failed(reason) = outcome {
+                            let _ = view.update(cx, |this, cx| {
+                                this.set_status(QuickStatus::Error(reason), cx)
+                            });
+                        }
+                    },
+                    cx,
+                );
+            }
             _ => {}
         })
         .detach();
@@ -319,7 +340,7 @@ impl Render for QuickNote {
             .px(px(8.))
             .pt(px(2.))
             .pb(px(4.))
-            .child(BlockEditor::new(&self.editor).auto_grow(6, 500))
+            .child(note_editor(&self.editor, 6, cx))
             // Painted over the empty editor, where its first line
             // will be; it takes no clicks.
             .when(show_hint, |el| {

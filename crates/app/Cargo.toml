@@ -36,6 +36,11 @@ windows = { version = "0.62", features = [
 # The "start with Windows" entry. Already built for the UI toolkit.
 windows-registry = "0.6"
 
+[dev-dependencies]
+# The paste tests drive a real editor with gpui's fake clipboard.
+gpui-kit = { workspace = true, features = ["test-support"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0"
 resvg = { version = "0.46", default-features = false }

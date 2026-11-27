@@ -36,51 +36,23 @@ pub(crate) fn into_frame(
             frame.leaves.push(LeafGeom {
                 info: *info,
                 geometry,
-                align: ColumnAlign::None,
             });
         }
     }
     frame
 }
 
+/// One laid-out leaf. Its `LeafGeometry` positions are where the text is
+/// painted, in aligned table cells too: gpui-kit 0.10 aligns a cell's
+/// content box (`items_center` / `items_end`) and draws the text unshifted
+/// inside it, where 0.9 painted it with a `text_align` offset that the
+/// positions left out.
 pub(crate) struct LeafGeom {
     pub(crate) info: LeafInfo,
     geometry: LeafGeometry,
-    /// A table cell's column alignment. gpui-kit paints centred and
-    /// right-aligned cell text shifted inside the text element, but
-    /// `LeafGeometry` positions are unshifted; `row_shift` puts it back.
-    pub(crate) align: ColumnAlign,
 }
 
 impl LeafGeom {
-    /// How far the row at `y` (an unshifted line top) is painted right of
-    /// where `LeafGeometry` reports it, for an aligned table cell.
-    fn row_shift(&self, y: Pixels) -> Pixels {
-        if matches!(self.align, ColumnAlign::None | ColumnAlign::Left) {
-            return px(0.);
-        }
-        let len = self.geometry.len();
-        let b = self.bounds();
-        let (mut lo, mut hi) = (None::<Pixels>, None::<Pixels>);
-        for i in 0..=len {
-            let p = self.geometry.position_for_index(i);
-            if (p.y - y).abs() < px(0.5) {
-                lo = Some(lo.map_or(p.x, |v: Pixels| v.min(p.x)));
-                hi = Some(hi.map_or(p.x, |v: Pixels| v.max(p.x)));
-            }
-        }
-        let (Some(lo), Some(hi)) = (lo, hi) else {
-            return px(0.);
-        };
-        let free = (b.right() - lo) - (hi - lo);
-        let free = free.max(px(0.));
-        match self.align {
-            ColumnAlign::Center => free / 2.,
-            ColumnAlign::Right => free,
-            _ => px(0.),
-        }
-    }
-
     pub(crate) fn bounds(&self) -> Bounds<Pixels> {
         self.geometry.bounds()
     }
@@ -107,20 +79,11 @@ impl LeafGeom {
 
     /// Top of the caret at `offset`, window coordinates.
     pub(crate) fn caret_point(&self, offset: usize) -> Point<Pixels> {
-        let mut p = self.geometry.position_for_index(self.index(offset));
-        p.x += self.row_shift(p.y);
-        p
+        self.geometry.position_for_index(self.index(offset))
     }
 
     /// Closest model offset for a window point.
     pub(crate) fn offset_at(&self, at: Point<Pixels>) -> usize {
-        let mut at = at;
-        if !matches!(self.align, ColumnAlign::None | ColumnAlign::Left) {
-            // The row under `at`, then undo its alignment shift.
-            let row = self.geometry.index_for_position(at);
-            let y = self.geometry.position_for_index(row).y;
-            at.x -= self.row_shift(y);
-        }
         let index = self.geometry.index_for_position(at);
         if self.info.atomic {
             usize::from(index * 2 > self.geometry.len().max(1))
@@ -326,6 +289,9 @@ pub(crate) struct TableShape {
 /// `border_r_1` between columns, `border_1` frame).
 const CELL_PAD_Y: f32 = 7.;
 const RULE: f32 = 1.;
+/// The narrowest a gpui-kit column gets, its padding and divider included
+/// (`CELL_MIN_PX`).
+const CELL_MIN: f32 = 48.;
 
 impl FrameLayout {
     /// Rebuild each table's column and row boxes from where its cells'
@@ -333,10 +299,15 @@ impl FrameLayout {
     /// `[lead slack][cell: px_3 + text + px_3][trail slack + divider]`, the
     /// slack split by the column alignment (Left: after, Centre: both
     /// sides, Right: before) and sized in proportion to the cell width.
-    /// The text element of a cell is the cell's content box, so its left
-    /// edge plus the alignment's slack share gives the column edge; the
-    /// one unknown, slack per pixel of cell, comes from the gaps between
-    /// neighbouring cells. Also records each cell's alignment.
+    /// A Left or None cell's text element fills the cell's content box.
+    /// A Centre or Right cell's element is only as wide as its text and is
+    /// aligned inside that box (gpui-kit 0.10 aligns the box, not the
+    /// text), so the box is the union of the column's elements, the widest
+    /// filling it, unless the column is at gpui-kit's minimum width: then
+    /// the box is that wide and holds the union by the alignment. Its edges
+    /// plus the alignment's slack share give the column edges; the one
+    /// unknown, slack per pixel of cell, comes from the gaps between
+    /// neighbouring cells.
     pub(crate) fn layout_tables(
         &mut self,
         shapes: &[TableShape],
@@ -346,29 +317,26 @@ impl FrameLayout {
         self.grids.clear();
         self.cell_boxes.clear();
         for shape in shapes {
-            for row in &shape.grid {
-                for (c, cell) in row.iter().enumerate() {
-                    let align = shape.aligns.get(c).copied().unwrap_or_default();
-                    if let Some(ix) = self.index.get(cell) {
-                        self.leaves[*ix].align = align;
-                    }
-                }
-            }
             let cols = shape.grid.iter().map(Vec::len).max().unwrap_or(0);
-            // Each column's text element (left, width): all cells of a
-            // column share it.
+            // Each column's content box (left, width), from its cells' text
+            // elements.
             let mut elems: Vec<Option<(Pixels, Pixels)>> = vec![None; cols];
             for row in &shape.grid {
                 for (c, cell) in row.iter().enumerate() {
-                    if elems[c].is_none()
-                        && let Some(leaf) = self.leaf(*cell)
-                    {
-                        let b = leaf.bounds();
-                        elems[c] = Some((b.left(), b.size.width));
-                    }
+                    let Some(leaf) = self.leaf(*cell) else {
+                        continue;
+                    };
+                    let b = leaf.bounds();
+                    elems[c] = Some(match elems[c] {
+                        None => (b.left(), b.size.width),
+                        Some((left, width)) => {
+                            let lo = left.min(b.left());
+                            (lo, (left + width).max(b.right()) - lo)
+                        }
+                    });
                 }
             }
-            let Some(elems) = elems.into_iter().collect::<Option<Vec<_>>>() else {
+            let Some(mut elems) = elems.into_iter().collect::<Option<Vec<_>>>() else {
                 continue;
             };
             if elems.is_empty() {
@@ -379,8 +347,19 @@ impl FrameLayout {
                 ColumnAlign::Right => (1., 0.),
                 _ => (0., 1.),
             };
-            let cell_w = |c: usize| elems[c].1 + pad_x * 2.;
             let rule = px(RULE);
+            for (c, (left, width)) in elems.iter_mut().enumerate() {
+                let divider = if c + 1 < cols { rule } else { px(0.) };
+                let narrowest = px(CELL_MIN) - divider - pad_x * 2.;
+                if *width < narrowest {
+                    // Only a Centre or Right column can fall short: its text
+                    // sits in the box as aligned.
+                    *left -= (narrowest - *width) * share(c).0;
+                    *width = narrowest;
+                }
+            }
+            let elems = elems;
+            let cell_w = |c: usize| elems[c].1 + pad_x * 2.;
             // Slack per pixel of cell width, from the first informative gap.
             let mut k: Option<f32> = None;
             for c in 0..cols.saturating_sub(1) {

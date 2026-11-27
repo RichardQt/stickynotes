@@ -27,6 +27,28 @@ use crate::{
 /// The Markdown for the blocks and partial blocks in `range`, or `None` when
 /// nothing is selected.
 pub(crate) fn selection_markdown(doc: &EditorDocument, range: ResolvedSelection) -> Option<String> {
+    let scratch = selection_document(doc, range)?;
+    let ids = scratch.children(scratch.root).to_vec();
+    Some(crate::serialize::join_blocks(&scratch, &ids))
+}
+
+/// The same cut as plain text: the readable clipboard payload other apps get
+/// while the Markdown above travels in the clipboard metadata.
+pub(crate) fn selection_plain_text(
+    doc: &EditorDocument,
+    range: ResolvedSelection,
+) -> Option<String> {
+    let scratch = selection_document(doc, range)?;
+    let ids = scratch.children(scratch.root).to_vec();
+    Some(crate::serialize::join_blocks_plain(&scratch, &ids))
+}
+
+/// The selected part of the tree as a scratch document, ready for either
+/// writer.
+fn selection_document(
+    doc: &EditorDocument,
+    range: ResolvedSelection,
+) -> Option<EditorDocument> {
     let (Some(first), Some(last)) = (
         doc.order.rank(range.start.block),
         doc.order.rank(range.end.block),
@@ -60,8 +82,7 @@ pub(crate) fn selection_markdown(doc: &EditorDocument, range: ResolvedSelection)
         caret,
     )
     .ok()?;
-    let ids = scratch.children(root).to_vec();
-    Some(crate::serialize::join_blocks(&scratch, &ids))
+    Some(scratch)
 }
 
 struct Cut<'a> {

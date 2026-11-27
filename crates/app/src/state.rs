@@ -2,7 +2,7 @@ use crate::quick_note::QuickNote;
 use crate::win;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
-use markdown_editor::{BlockEditorEvent, BlockEditorState};
+use markdown_editor::{BlockEditorEvent, BlockEditorState, ClipboardPolicy, PasteRequest};
 use stickynotes_core::{
     config::{self, AppConfig, SyncDelayError},
     shortcuts,
@@ -1002,10 +1002,15 @@ impl AppState {
         debug_log(&format!("select id={} len={}", short_id(id), md.len()));
         // The first paragraph is the note title; the rest is the body.
         let (title, body) = Self::split_title_body(&md);
+        // Another note opens at its top, not where the last one was scrolled.
+        self.scroll.set_offset(point(px(0.), px(0.)));
         let scroll = self.scroll.clone();
 
         let editor = cx.new(|cx| {
-            let mut state = BlockEditorState::new(window, cx).with_source(&body);
+            // Pastes come to `paste_into_note`, which also takes pictures.
+            let mut state = BlockEditorState::new(window, cx)
+                .with_source(&body)
+                .with_clipboard_policy(ClipboardPolicy::Host);
             state.set_scroll_handle(scroll);
             state.set_editor_style(
                 markdown_editor::BlockEditorStyle::default()
@@ -1016,13 +1021,16 @@ impl AppState {
             );
             state
         });
-        cx.subscribe_in(&editor, window, |this, _, event: &BlockEditorEvent, window, cx| {
+        cx.subscribe_in(&editor, window, |this, editor, event: &BlockEditorEvent, window, cx| {
             match event {
                 BlockEditorEvent::Changed { .. } => this.schedule_save(window, cx),
                 // Keep the formatting bar's active states in sync with the caret.
                 BlockEditorEvent::SelectionChanged => cx.notify(),
                 BlockEditorEvent::EditLinkRequested { .. } => this.open_link_popover(window, cx),
                 BlockEditorEvent::LinkClicked { url } => open_note_link(url, cx),
+                BlockEditorEvent::PasteRequested { request, item } => {
+                    this.paste_into_note(editor, request, item, cx)
+                }
                 _ => {}
             }
         })
@@ -1101,9 +1109,53 @@ impl AppState {
         }
     }
 
+    /// A paste into the note body (see [`crate::paste`]): text is pasted
+    /// right away, pictures once they are prepared.
+    fn paste_into_note(
+        &mut self,
+        editor: &Entity<BlockEditorState>,
+        request: &PasteRequest,
+        item: &ClipboardItem,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        let preparing = crate::paste::resolve(
+            editor,
+            request,
+            item,
+            move |outcome, cx| {
+                let _ = this.update(cx, |this, cx| this.picture_paste_done(outcome, cx));
+            },
+            cx,
+        );
+        if preparing {
+            self.status = SyncStatus::Busy(crate::paste::PREPARING.into());
+            cx.notify();
+        }
+    }
+
+    fn picture_paste_done(&mut self, outcome: crate::paste::Outcome, cx: &mut Context<Self>) {
+        match outcome {
+            crate::paste::Outcome::Failed(reason) => self.status = SyncStatus::Error(reason),
+            // Inserted: the edit's own save says "已自动保存" a moment later.
+            crate::paste::Outcome::Inserted | crate::paste::Outcome::Stale => {
+                if self.status == SyncStatus::Busy(crate::paste::PREPARING.into()) {
+                    self.status = SyncStatus::Idle;
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Split canonical markdown into (plain-text title, body markdown). The
     /// first paragraph is the note title, matching Windows Sticky Notes.
     fn split_title_body(md: &str) -> (String, String) {
+        // A picture on the first line belongs to the body: the title field is
+        // plain text and would keep only the picture's alt text.
+        let first = md.split('\n').next().unwrap_or_default();
+        if store::has_picture(first) {
+            return (String::new(), md.to_string());
+        }
         match md.split_once('\n') {
             Some((first, rest)) => (store::strip_markdown_syntax(first), rest.to_string()),
             None => (store::strip_markdown_syntax(md), String::new()),
@@ -1146,6 +1198,8 @@ impl AppState {
             } else {
                 format!("{title}\n{body}")
             };
+            // A picture's bytes are not characters the user wrote.
+            let src = store::strip_embedded_pictures(&src);
             let chars = src.chars().filter(|c| !c.is_whitespace()).count();
             let lines = if src.is_empty() { 0 } else { src.lines().count() };
             self.current_stats = (chars, lines);
@@ -2947,7 +3001,19 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_link_url;
+    use super::{normalize_link_url, AppState};
+
+    #[test]
+    fn a_note_that_starts_with_a_picture_keeps_it_in_the_body() {
+        let md = "![图片](data:image/png;base64,iVBORw0KGgo=)\n截图说明";
+        let (title, body) = AppState::split_title_body(md);
+        assert_eq!(title, "");
+        assert_eq!(body, md);
+        // Text first: that line is still the title.
+        let (title, body) = AppState::split_title_body("# 标题\n![图片](data:x)");
+        assert_eq!(title, "标题");
+        assert_eq!(body, "![图片](data:x)");
+    }
 
     #[test]
     fn normalize_link_url_adds_https_when_scheme_is_missing() {

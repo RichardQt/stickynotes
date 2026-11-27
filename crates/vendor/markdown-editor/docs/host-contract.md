@@ -76,6 +76,21 @@ with admitted text or `None` for image-only consumption. Requests are once-only;
 new requests, source edits, navigation, readonly state or ownership invalidation
 fence old resolutions. `PlainText` mode bypasses fragment Markdown parsing.
 
+For the editor's own copies the request also remembers the visible plain text
+and the Markdown from the clipboard metadata. `apply_paste()` restores that
+Markdown only when the host passes the visible text back unchanged; any other
+admitted text pastes as external text. `PasteRequest::is_plain()` reports a
+Cmd/Ctrl+Shift+V paste, which a host should resolve with text only.
+
+`apply_paste_markdown()` resolves a request with inline Markdown the host made
+itself instead of clipboard text, for example a pasted picture admitted as
+`![alt](data:image/png;base64,…)`. Each line becomes a paragraph, as typed; in
+a table cell the lines are joined with spaces. The insertion is one undo step.
+It returns `false` without inserting for a stale request or a paste position
+inside a code block. A host that prepares the Markdown off the UI thread keeps
+the request, then checks `is_paste_current()` before resolving it, which also
+tells the two refusals apart.
+
 `ImagePolicy::Placeholder` never calls the image source resolver or `img()` for
 standard image atoms: inline-flow atomic fallback text retains selection and
 source without implicit HTTP/file/data decoding. `Load` retains ordinary editor

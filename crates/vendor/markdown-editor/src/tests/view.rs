@@ -626,8 +626,8 @@ fn table_cells_click_type_tab_and_cell_selection(cx: &mut TestAppContext) {
     )));
     assert_eq!(editor.update(cx, |e, _| e.selection_ranges().len()), 4);
     keys(cx, "M-c");
-    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
-    assert_eq!(copied, "| x | y |\n| --- | --- |\n| 1 | 2 |");
+    assert_eq!(clipboard_text(cx), "x\ty\n1\t2");
+    assert_eq!(clipboard_markdown(cx), "| x | y |\n| --- | --- |\n| 1 | 2 |");
     // Delete clears contents and keeps the table.
     keys(cx, "backspace");
     assert_eq!(
@@ -651,7 +651,7 @@ fn backspace_after_table_selects_it_and_copy_round_trips(cx: &mut TestAppContext
         "first Backspace only selects"
     );
     keys(cx, "M-c");
-    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    let copied = clipboard_markdown(cx);
     assert!(copied.starts_with("| x | y |"), "{copied:?}");
     assert!(original.contains(&copied));
     keys(cx, "M-x");
@@ -1187,8 +1187,9 @@ fn inline_atom_is_one_unit(cx: &mut TestAppContext) {
     });
     assert_eq!((anchor, head), (1, 4));
     keys(cx, "M-c");
-    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
-    assert_eq!(copied, "![pic](x.png)");
+    // Other apps get the alt text; the metadata keeps the atom's Markdown.
+    assert_eq!(clipboard_text(cx), "pic");
+    assert_eq!(clipboard_markdown(cx), "![pic](x.png)");
     // Right moves over it in one step; Backspace removes it whole; undo restores.
     caret_at(&editor, cx, 0, 1);
     keys(cx, "right");
@@ -2763,8 +2764,23 @@ fn clipboard_text(cx: &mut VisualTestContext) -> String {
     cx.read_from_clipboard().and_then(|c| c.text()).unwrap()
 }
 
+/// The editor's own Markdown from the clipboard metadata (`tag\nmarkdown`).
+fn clipboard_markdown(cx: &mut VisualTestContext) -> String {
+    let metadata = cx.read_from_clipboard().and_then(|c| c.metadata().cloned()).unwrap();
+    let (_, markdown) = metadata.split_once('\n').expect("v2 clipboard metadata");
+    markdown.to_string()
+}
+
+/// The tag and Markdown of the editor's own clipboard copy.
+fn clipboard_tag_and_markdown(cx: &mut VisualTestContext) -> (String, String) {
+    let metadata = cx.read_from_clipboard().and_then(|c| c.metadata().cloned()).unwrap();
+    let (tag, markdown) = metadata.split_once('\n').expect("v2 clipboard metadata");
+    (tag.to_string(), markdown.to_string())
+}
+
 /// Copy `from..to` of `doc`, then paste at the end of the document's last
-/// leaf (a "T" paragraph appended to `doc`). Returns (clipboard, source).
+/// leaf (a "T" paragraph appended to `doc`). Returns the Markdown from the
+/// clipboard metadata and the source after the paste.
 fn copy_paste(
     cx: &mut TestAppContext,
     doc: &str,
@@ -2774,7 +2790,7 @@ fn copy_paste(
     let (editor, cx) = open(cx, &format!("{doc}\n\nT"));
     select_in(&editor, cx, from, to);
     keys(cx, "M-c");
-    let clip = clipboard_text(cx);
+    let clip = clipboard_markdown(cx);
     let last = editor.read_with(cx, |e, _| e.model().document().leaves().count() - 1);
     caret_at(&editor, cx, last, 1);
     keys(cx, "M-v");
@@ -2857,10 +2873,6 @@ fn leaf_count(editor: &Entity<BlockEditorState>, cx: &VisualTestContext) -> usiz
     editor.read_with(cx, |e, _| e.model().document().leaves().count())
 }
 
-fn copy_tag(cx: &mut VisualTestContext) -> Option<String> {
-    cx.read_from_clipboard().and_then(|c| c.metadata().cloned())
-}
-
 /// The document ends in a paragraph "T"; make it an empty paragraph with the
 /// caret in it.
 fn empty_last_paragraph(editor: &Entity<BlockEditorState>, cx: &mut VisualTestContext) {
@@ -2879,7 +2891,7 @@ fn copy_blocks_paste(
     let (editor, cx) = open(cx, &format!("{doc}\n\nT"));
     select_in(&editor, cx, from, to);
     keys(cx, "M-c");
-    let clip = clipboard_text(cx);
+    let clip = clipboard_markdown(cx);
     empty_last_paragraph(&editor, cx);
     keys(cx, "M-v");
     (clip, source(&editor, cx))
@@ -2903,15 +2915,46 @@ fn d18_the_copy_is_tagged_as_our_own_block_markdown(cx: &mut TestAppContext) {
     select_in(&editor, cx, (0, 0), (1, 3));
     keys(cx, "M-c");
     assert_eq!(
-        copy_tag(cx).as_deref(),
-        Some("gpui-kit/block-editor/blocks-markdown/v1")
+        clipboard_tag_and_markdown(cx),
+        (
+            "gpui-kit/block-editor/blocks-markdown/v2".to_string(),
+            "one\n\ntwo".to_string()
+        )
     );
+    // The visible text other apps receive is plain, without structure.
+    assert_eq!(clipboard_text(cx), "one\n\ntwo");
     // Inside one block it is still the inline copy.
     select_in(&editor, cx, (0, 0), (0, 2));
     keys(cx, "M-c");
     assert_eq!(
-        copy_tag(cx).as_deref(),
-        Some("gpui-kit/block-editor/inline-markdown/v1")
+        clipboard_tag_and_markdown(cx),
+        (
+            "gpui-kit/block-editor/inline-markdown/v2".to_string(),
+            "on".to_string()
+        )
+    );
+}
+
+#[gpui::test]
+fn own_copy_is_plain_for_other_apps_and_markdown_for_our_paste(cx: &mut TestAppContext) {
+    // Special characters are escaped only in the metadata: other apps see
+    // the text the note shows, not its Markdown source.
+    let (editor, cx) = open(cx, "C:\\\\Users\\\\x and 2\\*3\n\nT");
+    select_in(&editor, cx, (0, 0), (0, usize::MAX));
+    keys(cx, "M-c");
+    assert_eq!(clipboard_text(cx), "C:\\Users\\x and 2*3");
+    assert_eq!(clipboard_markdown(cx), "C:\\\\Users\\\\x and 2\\*3");
+    // Structure plain text can carry survives: bullets, task boxes, numbers.
+    let (_editor, cx) = open(cx, "# Title\n\n- one\n- [x] two\n\n1. a\n2. b");
+    keys(cx, "M-a");
+    keys(cx, "M-c");
+    assert_eq!(
+        clipboard_text(cx),
+        "Title\n\n• one\n[x] two\n\n1. a\n2. b"
+    );
+    assert_eq!(
+        clipboard_markdown(cx),
+        "# Title\n\n- one\n- [x] two\n\n1. a\n2. b"
     );
 }
 
@@ -2922,7 +2965,7 @@ fn d18_select_all_copy_of_every_block_kind_round_trips(cx: &mut TestAppContext) 
     let canonical = MIX.to_string();
     select_in(&editor, cx, (0, 0), (leaves - 1, usize::MAX));
     keys(cx, "M-c");
-    assert_eq!(clipboard_text(cx), canonical);
+    assert_eq!(clipboard_markdown(cx), canonical);
     empty_last_paragraph(&editor, cx);
     let before = source(&editor, cx);
     keys(cx, "M-v");
@@ -3034,15 +3077,15 @@ fn d18_paste_plain_stays_literal_and_external_text_is_conservative(cx: &mut Test
     let (editor, cx) = open(cx, "# Title\n\n- one\n\nT");
     select_in(&editor, cx, (0, 0), (1, 3));
     keys(cx, "M-c");
-    assert_eq!(clipboard_text(cx), "# Title\n\n- one");
+    assert_eq!(clipboard_text(cx), "Title\n\n• one");
     let last = leaf_count(&editor, cx) - 1;
     caret_at(&editor, cx, last, 1);
     keys(cx, "M-shift-v");
-    // Raw characters: no heading, no list.
+    // Raw characters: no heading and no second list.
     let src = source(&editor, cx);
-    assert!(src.contains("T# Title"), "{src:?}");
-    assert!(src.ends_with("\\- one"), "{src:?}");
-    assert!(!src[8..].contains("\n# Title"), "{src:?}");
+    assert!(src.contains("TTitle"), "{src:?}");
+    assert!(src.trim_end().ends_with("• one"), "{src:?}");
+    assert_eq!(src.matches("# Title").count(), 1, "{src:?}");
     // The same text without our tag is the conservative import: multi-block
     // Markdown becomes blocks, a single line stays text.
     cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("# x".into())));
@@ -3061,11 +3104,12 @@ fn d17_paste_plain_stays_literal_and_external_text_is_conservative(cx: &mut Test
     let (editor, cx) = open(cx, "**bold** x\n\nT");
     select_in(&editor, cx, (0, 0), (0, 4));
     keys(cx, "M-c");
-    assert_eq!(clipboard_text(cx), "**bold**");
+    assert_eq!(clipboard_text(cx), "bold");
+    assert_eq!(clipboard_markdown(cx), "**bold**");
     caret_at(&editor, cx, 1, 1);
     keys(cx, "M-shift-v");
     // Raw characters, no marks.
-    assert_eq!(source(&editor, cx), "**bold** x\n\nT\\*\\*bold\\*\\*");
+    assert_eq!(source(&editor, cx), "**bold** x\n\nTbold");
     // External plain text (no tag) is not parsed as inline Markdown.
     cx.update(|_, cx| {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("2*3*4 and **x**".into()))
@@ -3074,7 +3118,7 @@ fn d17_paste_plain_stays_literal_and_external_text_is_conservative(cx: &mut Test
     keys(cx, "M-v");
     assert_eq!(
         source(&editor, cx),
-        "**bold** x\n\n2\\*3\\*4 and \\*\\*x\\*\\*T\\*\\*bold\\*\\*"
+        "**bold** x\n\n2\\*3\\*4 and \\*\\*x\\*\\*Tbold"
     );
     // The same text, tagged as our own copy, is parsed.
     cx.update(|_, cx| {
@@ -3121,15 +3165,17 @@ fn d17_table_cell_copy_still_copies_structure(cx: &mut TestAppContext) {
     cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
     cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
     keys(cx, "M-c");
+    assert_eq!(clipboard_text(cx), "x\ty\n1\t2");
     assert_eq!(
-        clipboard_text(cx),
+        clipboard_markdown(cx),
         "| **x** | y |\n| --- | --- |\n| `1` | 2 |"
     );
     // Marks inside a single cell's text survive a copy/paste too.
     let (editor, cx) = open(cx, "| **x** y | z |\n| --- | --- |\n| a | b |");
     select_in(&editor, cx, (0, 0), (0, 3));
     keys(cx, "M-c");
-    assert_eq!(clipboard_text(cx), "**x** y");
+    assert_eq!(clipboard_text(cx), "x y");
+    assert_eq!(clipboard_markdown(cx), "**x** y");
     caret_at(&editor, cx, 3, 1);
     keys(cx, "M-v");
     assert_eq!(
@@ -3162,6 +3208,239 @@ fn d17_host_policy_keeps_the_own_copy_flag_across_apply_paste(cx: &mut TestAppCo
         assert!(s.apply_paste(&request, item.text().as_deref(), cx))
     });
     assert_eq!(source(&editor, cx), "`c` d\n\nT`c`");
+}
+
+/// The host pastes our own copy by passing the visible text back unchanged;
+/// a `None` (wholly handled) or rewritten admission never inserts the
+/// editor's private Markdown (the visible text of a v2 copy is plain).
+#[gpui::test]
+fn host_apply_paste_respects_none_and_rewritten_text(cx: &mut TestAppContext) {
+    let (editor, cx) = open(cx, "**bold** d\n\nT");
+    let pending = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = pending.clone();
+    let _sub = cx.update(|_, cx| {
+        cx.subscribe(&editor, move |_, event: &crate::BlockEditorEvent, _| {
+            if let crate::BlockEditorEvent::PasteRequested { request, item } = event {
+                sink.borrow_mut().push((request.clone(), item.clone()));
+            }
+        })
+    });
+    editor.update(cx, |s, _| {
+        s.set_clipboard_policy(crate::ClipboardPolicy::Host)
+    });
+    select_in(&editor, cx, (0, 0), (0, 4));
+    keys(cx, "M-c");
+    // The visible text is plain "bold", the marks live in the metadata.
+    caret_at(&editor, cx, 1, 1);
+    keys(cx, "M-v");
+    let (request, item) = pending.borrow_mut().pop().unwrap();
+    // The host passes the visible text back unchanged: marks are restored.
+    editor.update(cx, |s, cx| {
+        assert!(s.apply_paste(&request, item.text().as_deref(), cx))
+    });
+    assert_eq!(source(&editor, cx), "**bold** d\n\nT**bold**");
+    // `None`: wholly handled or rejected — nothing is inserted.
+    keys(cx, "M-v");
+    let (request, _) = pending.borrow_mut().pop().unwrap();
+    editor.update(cx, |s, cx| {
+        assert!(s.apply_paste(&request, None, cx))
+    });
+    assert_eq!(source(&editor, cx), "**bold** d\n\nT**bold**");
+    // Rewritten text is the host's own: it inserts as external plain text,
+    // not as the copy's Markdown. `**` in it stays literal, where a paste of
+    // the private Markdown would have applied marks instead.
+    keys(cx, "M-v");
+    let (request, _) = pending.borrow_mut().pop().unwrap();
+    editor.update(cx, |s, cx| {
+        assert!(s.apply_paste(&request, Some("**x**"), cx))
+    });
+    let src = source(&editor, cx);
+    assert!(
+        src.contains("\\*\\*x\\*\\*"),
+        "rewritten text is not parsed as our Markdown: {src:?}"
+    );
+}
+
+/// A 1×1 PNG as a `data:` URL, and the Markdown a host inserts for it.
+const DOT_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+fn dot_markdown() -> String {
+    format!("![图片]({DOT_URL})")
+}
+
+/// Image atoms in each leaf, by URL.
+fn image_urls(editor: &Entity<BlockEditorState>, cx: &VisualTestContext) -> Vec<Vec<String>> {
+    editor.read_with(cx, |e, _| {
+        e.model()
+            .document()
+            .leaves()
+            .map(|leaf| {
+                e.model()
+                    .doc()
+                    .inline(leaf.id())
+                    .map(|inline| {
+                        inline
+                            .atoms()
+                            .iter()
+                            .filter_map(|(_, atom)| match atom {
+                                crate::inline::InlineAtom::Image(image) => {
+                                    Some(image.url.to_string())
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    })
+}
+
+/// Host policy, a picture on the clipboard and Ctrl/Cmd+V at `(leaf,
+/// offset)`: the request a host resolves once it has embedded the picture.
+fn picture_paste(
+    editor: &Entity<BlockEditorState>,
+    cx: &mut VisualTestContext,
+    leaf: usize,
+    offset: usize,
+) -> crate::PasteRequest {
+    let pending = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = pending.clone();
+    let subscription = cx.update(|_, cx| {
+        cx.subscribe(editor, move |_, event: &crate::BlockEditorEvent, _| {
+            if let crate::BlockEditorEvent::PasteRequested { request, item } = event {
+                sink.borrow_mut().push((request.clone(), item.clone()));
+            }
+        })
+    });
+    editor.update(cx, |s, _| {
+        s.set_clipboard_policy(crate::ClipboardPolicy::Host)
+    });
+    caret_at(editor, cx, leaf, offset);
+    let png = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0x89, b'P', b'N', b'G']);
+    cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_image(&png)));
+    keys(cx, "M-v");
+    drop(subscription);
+    let (request, item) = pending.borrow_mut().pop().expect("a paste request");
+    // The host sees a picture and no text.
+    assert_eq!(item.text(), None);
+    assert!(!request.is_plain());
+    request
+}
+
+#[gpui::test]
+fn copied_cells_keep_one_row_per_line_when_a_cell_breaks(cx: &mut TestAppContext) {
+    let (editor, cx) = open(cx, "| a<br>b | c |\n| --- | --- |\n| 1 | 2 |\n\nT");
+    let (first, last) = editor.read_with(cx, |e, _| {
+        let leaves: Vec<_> = e.model().document().leaves().map(|l| l.id()).collect();
+        (leaves[0], leaves[3])
+    });
+    editor.update(cx, |e, cx| {
+        e.set_selection(BlockSelection::Cells { anchor: first, head: last }, cx)
+            .unwrap()
+    });
+    keys(cx, "M-c");
+    // A spreadsheet reads a newline as the next row: the break is a space.
+    assert_eq!(clipboard_text(cx), "a b\tc\n1\t2");
+    // Copying the whole table along with the text after it does the same.
+    select_in(&editor, cx, (0, 0), (4, 1));
+    keys(cx, "M-c");
+    assert_eq!(clipboard_text(cx), "a b\tc\n1\t2\n\nT");
+}
+
+#[gpui::test]
+fn host_pasted_picture_becomes_an_image_atom_in_one_undo_step(cx: &mut TestAppContext) {
+    let (editor, cx) = open(cx, "before after");
+    let request = picture_paste(&editor, cx, 0, 7);
+    // Nothing is inserted until the host resolves the request.
+    assert_eq!(source(&editor, cx), "before after");
+    editor.update(cx, |s, cx| {
+        assert!(s.apply_paste_markdown(&request, &dot_markdown(), cx))
+    });
+    // Offset 7 is after "before ": the picture goes right before "after".
+    assert_eq!(source(&editor, cx), format!("before {}after", dot_markdown()));
+    assert_eq!(image_urls(&editor, cx), vec![vec![DOT_URL.to_string()]]);
+    // The request is spent.
+    editor.update(cx, |s, cx| {
+        assert!(!s.apply_paste_markdown(&request, &dot_markdown(), cx))
+    });
+    keys(cx, "M-z");
+    assert_eq!(source(&editor, cx), "before after");
+    keys(cx, "M-shift-z");
+    assert_eq!(image_urls(&editor, cx), vec![vec![DOT_URL.to_string()]]);
+    // Plain text copy of it is the alt text; ours keeps the picture.
+    select_in(&editor, cx, (0, 0), (0, usize::MAX));
+    keys(cx, "M-c");
+    assert_eq!(clipboard_text(cx), "before 图片after");
+    assert_eq!(
+        clipboard_markdown(cx),
+        format!("before {}after", dot_markdown())
+    );
+}
+
+#[gpui::test]
+fn host_pasted_pictures_go_one_per_line_and_share_a_cell(cx: &mut TestAppContext) {
+    let two = format!("{}\n{}", dot_markdown(), dot_markdown());
+    let (editor, cx) = open(cx, "x");
+    let request = picture_paste(&editor, cx, 0, 1);
+    editor.update(cx, |s, cx| assert!(s.apply_paste_markdown(&request, &two, cx)));
+    assert_eq!(
+        image_urls(&editor, cx),
+        vec![vec![DOT_URL.to_string()], vec![DOT_URL.to_string()]]
+    );
+    // In a table cell both land in the cell, side by side.
+    let (editor, cx) = open(cx, "| a | b |\n| --- | --- |\n| 1 | 2 |");
+    let request = picture_paste(&editor, cx, 2, 1);
+    editor.update(cx, |s, cx| assert!(s.apply_paste_markdown(&request, &two, cx)));
+    let urls = image_urls(&editor, cx);
+    assert_eq!(urls.len(), 4, "still four cells");
+    assert_eq!(urls[2].len(), 2, "{urls:?}");
+}
+
+#[gpui::test]
+fn host_pasted_picture_is_refused_in_code_and_when_stale(cx: &mut TestAppContext) {
+    let (editor, cx) = open(cx, "```\ncode\n```\n\nT");
+    let request = picture_paste(&editor, cx, 0, 2);
+    editor.update(cx, |s, cx| {
+        assert!(s.is_paste_current(&request));
+        assert!(!s.apply_paste_markdown(&request, &dot_markdown(), cx))
+    });
+    assert_eq!(source(&editor, cx), "```\ncode\n```\n\nT");
+    // Typing while the picture was being prepared makes the request stale.
+    let request = picture_paste(&editor, cx, 1, 1);
+    type_text(cx, "y");
+    editor.update(cx, |s, cx| {
+        assert!(!s.is_paste_current(&request));
+        assert!(!s.apply_paste_markdown(&request, &dot_markdown(), cx))
+    });
+    assert_eq!(source(&editor, cx), "```\ncode\n```\n\nTy");
+}
+
+#[gpui::test]
+fn a_screenshot_sized_data_url_pastes_and_round_trips(cx: &mut TestAppContext) {
+    // About what a 1920×1080 screenshot weighs once embedded.
+    let payload: String = "iVBORw0KGgo"
+        .chars()
+        .chain(std::iter::repeat_n('A', 1_400_000))
+        .collect();
+    let url = format!("data:image/png;base64,{payload}");
+    let (editor, cx) = open(cx, "T");
+    let request = picture_paste(&editor, cx, 0, 1);
+    let started = std::time::Instant::now();
+    editor.update(cx, |s, cx| {
+        assert!(s.apply_paste_markdown(&request, &format!("![图片]({url})"), cx))
+    });
+    let src = source(&editor, cx);
+    let elapsed = started.elapsed();
+    assert_eq!(src, format!("T![图片]({url})"));
+    assert_eq!(image_urls(&editor, cx), vec![vec![url.clone()]]);
+    // Reopening the saved source gives the same picture back.
+    let (reopened, cx) = open(cx, &src);
+    assert_eq!(image_urls(&reopened, cx), vec![vec![url]]);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "a big picture pastes without a long stall: {elapsed:?}"
+    );
 }
 
 /// The caret is the input's one-pixel line (main #3515), snapped to whole
@@ -3718,24 +3997,33 @@ fn cell_carets(
 #[gpui::test]
 fn d20_caret_x_follows_cell_alignment(cx: &mut TestAppContext) {
     let (editor, cx) = open(cx, ALIGNED);
-    // Row 1: a (Left), "centred text" (Centre), 42 (Right), plain (None).
-    let (b, x0, x1) = cell_carets(&editor, cx, 4);
-    assert_eq!(x0, b.left(), "left");
-    let (b, x0, x1c) = cell_carets(&editor, cx, 5);
-    let w = x1c - x0;
-    assert!(
-        (x0 - (b.left() + (b.size.width - w) / 2.)).abs() < px(0.6),
-        "centre"
+    // Rows 1 and 2: a / "a longer…" (Left), "centred text" / x (Centre),
+    // 42 / 1234567 (Right), plain / y (None). The cells of a column line up
+    // by its alignment where their text is narrower than the column.
+    let (_, a0, _) = cell_carets(&editor, cx, 4);
+    let (_, long0, _) = cell_carets(&editor, cx, 8);
+    assert_eq!(a0, long0, "left");
+    let (_, c0, c1) = cell_carets(&editor, cx, 5);
+    let (_, x0, x1) = cell_carets(&editor, cx, 9);
+    assert!(((c0 + c1) / 2. - (x0 + x1) / 2.).abs() < px(0.6), "centre");
+    let (_, s0, s1) = cell_carets(&editor, cx, 6);
+    let (_, l0, l1) = cell_carets(&editor, cx, 10);
+    assert!((s1 - l1).abs() < px(0.6), "right ends line up");
+    assert!(s0 > l0 + px(10.), "the shorter right cell starts further in");
+    let (_, p0, _) = cell_carets(&editor, cx, 7);
+    let (_, y0, _) = cell_carets(&editor, cx, 11);
+    assert_eq!(p0, y0, "none");
+
+    // gpui-kit aligns the cell's box and draws its lines unshifted inside
+    // it, so a wrapped right-aligned cell's first line starts at the left
+    // of its text.
+    let (editor, cx) = open(
+        cx,
+        "| k | v |\n| --- | ---: |\n| a | a right-aligned cell long enough to wrap onto a second line of the column |",
     );
-    let (b, x0, x1r) = cell_carets(&editor, cx, 6);
-    assert!(
-        (x1r - b.right()).abs() < px(0.6),
-        "right end at the right edge"
-    );
-    assert!(x0 > b.left(), "right start shifted");
-    let (b, x0n, _) = cell_carets(&editor, cx, 7);
-    assert_eq!(x0n, b.left(), "none");
-    let _ = x1;
+    let (b, x0, _) = cell_carets(&editor, cx, 3);
+    assert!(b.size.height > px(30.), "the cell wraps: {b:?}");
+    assert_eq!(x0, b.left(), "first line start");
 }
 
 #[gpui::test]
@@ -4457,3 +4745,4 @@ fn closing_first_rules_leave_literal_punctuation(cx: &mut TestAppContext) {
     type_chars(cx, "*");
     assert_eq!(source(&editor, cx), "`a *b*`", "inside inline code");
 }
+

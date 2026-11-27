@@ -160,11 +160,12 @@ step (separate from plain Backspace/Delete); a line delete is its own.
 
 ## Known limitations
 
-- Copying across blocks writes Markdown and pastes back as blocks (headings,
-  lists, quotes, code, tables, tasks, marks). A table the selection touches is
-  copied whole, and a selection starting inside a nested list lifts the nested
-  items out instead of copying an empty parent item. Pasting a list directly
-  after another list joins them.
+- Copying across blocks gives other apps plain text and keeps the structure
+  (headings, lists, quotes, code, tables, tasks, marks) in the clipboard
+  metadata, so the editor's own paste restores blocks. A table the selection
+  touches is copied whole, and a selection starting inside a nested list lifts
+  the nested items out instead of copying an empty parent item. Pasting a list
+  directly after another list joins them.
 - Empty paragraphs have no Markdown form and disappear on save; list
   tightness can change once on the first save, after which output is stable.
 - A `BlockEditor` is as tall as its text. Give it `min_h_full()` (and padding

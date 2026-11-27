@@ -1,5 +1,37 @@
 //! Plain-text previews (list title + snippet) derived from a note's Markdown.
 
+use std::borrow::Cow;
+
+/// The note's Markdown with the bytes of every embedded picture (a `data:`
+/// URL, see [`crate::picture`]) left out: `![图片](data:…)` becomes
+/// `![图片]()`. Previews, search and counts look at what the note says; a
+/// picture's base64 would otherwise match every query and fill snippets.
+pub fn strip_embedded_pictures(markdown: &str) -> Cow<'_, str> {
+    const OPEN: &str = "](data:";
+    if !markdown.contains(OPEN) {
+        return Cow::Borrowed(markdown);
+    }
+    let mut out = String::with_capacity(1024);
+    let mut rest = markdown;
+    while let Some(at) = rest.find(OPEN) {
+        // Keep `](`, drop the URL up to its `)`: base64 and media types hold
+        // no parenthesis, and a destination never spans lines.
+        out.push_str(&rest[..at + 2]);
+        let url = &rest[at + 2..];
+        let end = url.find([')', '\n']).unwrap_or(url.len());
+        rest = &url[end..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Whether a line of Markdown shows a picture (`![alt](…)`). Such a line is
+/// never a note's plain-text title: making it one would keep only the alt
+/// text and drop the picture.
+pub fn has_picture(line: &str) -> bool {
+    line.find("![").is_some_and(|at| line[at..].contains("]("))
+}
+
 /// Strip Markdown formatting syntax from a single line of text so list previews show clean plain text.
 pub fn strip_markdown_syntax(input: &str) -> String {
     let mut s = input.trim();
@@ -164,6 +196,7 @@ fn table_row_preview(line: &str) -> Option<String> {
 /// them and treats their content as code); search drops them entirely, so a
 /// match window never shows a stray language name.
 fn preview_lines(markdown: &str, keep_fences: bool) -> String {
+    let markdown = strip_embedded_pictures(markdown);
     let mut out = String::with_capacity(markdown.len());
     let mut in_fence = false;
     for line in markdown.split('\n') {
@@ -358,5 +391,54 @@ mod tests {
         let lower = md.to_lowercase();
         assert!(snippet_around_match(md, &lower, "关键词").is_some());
         assert!(snippet_around_match(md, &lower, "不存在的词").is_none());
+    }
+
+    const PICTURE: &str = "![图片](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)";
+
+    #[test]
+    fn an_embedded_picture_previews_as_its_alt_text() {
+        let (title, snippet) = title_and_snippet(&format!("{PICTURE}\n\n截图说明 {PICTURE} 结束"));
+        assert_eq!(title, "图片");
+        assert_eq!(snippet, "截图说明 图片 结束");
+        assert!(!snippet.contains("base64"));
+    }
+
+    #[test]
+    fn search_never_sees_a_pictures_bytes() {
+        let md = format!("标题\n\n前面的文字 {PICTURE} 后面的文字");
+        let text = search_text(&md);
+        assert!(!text.contains("data:"), "got: {text}");
+        assert!(!text.contains("iVBOR"), "got: {text}");
+        assert!(text.contains("前面的文字 ![图片]() 后面的文字"), "got: {text}");
+        // A query that occurs only inside the base64 finds nothing.
+        let lower = text.to_lowercase();
+        assert!(snippet_around_match(&text, &lower, "ivbor").is_none());
+        let snippet = snippet_around_match(&text, &lower, "后面").unwrap();
+        assert!(snippet.contains("图片") && !snippet.contains("data:"), "{snippet}");
+    }
+
+    #[test]
+    fn stripping_pictures_leaves_other_text_alone() {
+        assert!(matches!(
+            strip_embedded_pictures("no pictures [here](https://x.dev)"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            strip_embedded_pictures("a ![x](data:image/png;base64,AAAA) b ![y](data:image/gif;base64,BB) c"),
+            "a ![x]() b ![y]() c"
+        );
+        // An unclosed one is cut at the end of its line.
+        assert_eq!(strip_embedded_pictures("![x](data:abc\nnext"), "![x](\nnext");
+    }
+
+    #[test]
+    fn a_line_with_a_picture_is_recognised() {
+        assert!(has_picture(PICTURE));
+        assert!(has_picture("看这个 ![图](https://x.dev/a.png) 吧"));
+        assert!(!has_picture("普通标题"));
+        assert!(!has_picture("[链接](https://x.dev)"));
+        assert!(!has_picture("感叹! [不是图片]"));
+        // Escaped by the editor when typed as text.
+        assert!(!has_picture("!\\[x\\](y)"));
     }
 }

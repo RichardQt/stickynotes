@@ -10,10 +10,9 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::Sizable as _;
-use gpui_kit::component::{Icon, IconName};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use markdown_editor::component::BlockEditor;
 use markdown_editor::{
     BlockEditorModel, BlockEditorState, BlockKind, EditorCommand, MarkKind, MarkState,
 };
@@ -36,9 +35,36 @@ pub(crate) const TITLEBAR_H: Pixels = px(38.);
 /// and CJK fallback fonts), or the input clips the glyphs.
 const TITLE_TEXT_SIZE: Pixels = px(22.);
 const TITLE_LINE_H: Pixels = px(32.);
-/// Horizontal inset the markdown editor applies inside its own viewport.
-/// The title field and its rule share it so all three left edges line up.
+/// Horizontal inset of the markdown editor's text ([`note_editor`]). The
+/// title field and its rule share it so all three left edges line up.
 const EDITOR_TEXT_INSET: Rems = Rems(0.625);
+/// Vertical inset of the editor's text, and the height of one of its rows:
+/// the proportions of `markdown_editor::component::BlockEditor`.
+const EDITOR_TEXT_INSET_Y: Rems = Rems(0.5);
+const EDITOR_ROW_H: f32 = 1.5;
+
+/// A note's markdown editor, as tall as its content and at least `min_rows`
+/// rows, inside the window's own scroll container. The editor holds that
+/// container's handle (`set_scroll_handle`) to keep the caret in view.
+///
+/// Not `markdown_editor::component::BlockEditor`: that wrapper is a scroll
+/// container itself and tracks the editor's handle too. Two containers on
+/// one handle share one offset, and the inner one, never taller than its
+/// content, clamped it back to zero on every frame, so a note taller than
+/// the window (a pasted screenshot, a long text) jumped back to the top.
+pub(crate) fn note_editor(editor: &Entity<BlockEditorState>, min_rows: usize, cx: &App) -> Div {
+    let min_h = rems(min_rows as f32 * EDITOR_ROW_H + EDITOR_TEXT_INSET_Y.0 * 2.);
+    div()
+        .w_full()
+        .min_w_0()
+        .text_color(cx.theme().foreground)
+        .child(
+            markdown_editor::BlockEditor::new(editor)
+                .min_h(min_h)
+                .px(EDITOR_TEXT_INSET)
+                .py(EDITOR_TEXT_INSET_Y),
+        )
+}
 
 // =========================================================================
 // Unified Shell & Crisp Alabaster / Pure-White Surface Tokens
@@ -2819,7 +2845,7 @@ impl AppState {
                     .px_8()
                     .pt(px(16.))
                     .pb_6()
-                    .child(BlockEditor::new(&editor).auto_grow(12, 60)),
+                    .child(note_editor(&editor, 12, cx)),
             );
 
         let animated_sheet: AnyElement = match (&self.selected_id, reduce_motion) {
@@ -3473,4 +3499,117 @@ pub(crate) fn settings_switch(
                     },
                 ]),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // The plain test attribute: `gpui_kit::*` brings gpui's own `test` along.
+    use core::prelude::v1::test;
+    use markdown_editor::{BlockEditorEvent, ClipboardPolicy};
+
+    /// The note sheet's shape: a scrolling canvas with the title above the
+    /// body, and the editor holding the canvas's scroll handle.
+    struct Sheet {
+        editor: Entity<BlockEditorState>,
+        scroll: ScrollHandle,
+    }
+
+    impl Render for Sheet {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(600.)).h(px(500.)).flex().flex_col().child(
+                div()
+                    .id("editor-canvas")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(div().h(px(60.)).child("标题"))
+                    .child(
+                        div()
+                            .w_full()
+                            .px_8()
+                            .pt(px(16.))
+                            .pb_6()
+                            .child(note_editor(&self.editor, 12, cx)),
+                    ),
+            )
+        }
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let picture = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 160])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(picture)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        png.into_inner()
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[test]
+    fn a_note_made_taller_than_the_window_by_a_picture_scrolls_and_stays_scrolled() {
+        let mut cx = TestAppContext::single();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            markdown_editor::init(cx);
+        });
+        let (sheet, cx) = cx.add_window_view(|window, cx| {
+            let scroll = ScrollHandle::new();
+            let editor = cx.new(|cx| {
+                let mut state = BlockEditorState::new(window, cx)
+                    .with_source("截图：")
+                    .with_clipboard_policy(ClipboardPolicy::Host);
+                state.set_scroll_handle(scroll.clone());
+                state
+            });
+            Sheet { editor, scroll }
+        });
+        let (editor, scroll) =
+            sheet.read_with(cx, |sheet, _| (sheet.editor.clone(), sheet.scroll.clone()));
+        cx.update(|_, cx| {
+            cx.subscribe(&editor, |editor, event: &BlockEditorEvent, cx| {
+                if let BlockEditorEvent::PasteRequested { request, item } = event {
+                    crate::paste::resolve(&editor, request, item, |_, _| {}, cx);
+                }
+            })
+            .detach();
+        });
+        draw(cx);
+        assert_eq!(scroll.max_offset().y, px(0.), "a short note does not scroll");
+
+        // A screenshot taller than the window, pasted at the end.
+        let shot = Image::from_bytes(ImageFormat::Png, png(400, 900));
+        editor.update(cx, |editor, cx| {
+            let _ = editor.select_end(cx);
+            editor.paste(ClipboardItem::new_image(&shot), false, cx);
+        });
+        draw(cx);
+        let max = scroll.max_offset().y;
+        assert!(max >= px(400.), "the picture is in the scroll range: {max:?}");
+
+        // Scroll down: the note stays there frame after frame instead of
+        // jumping back to its top.
+        cx.simulate_event(ScrollEvent {
+            position: point(px(300.), px(250.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-300.))),
+            ..Default::default()
+        });
+        draw(cx);
+        assert_eq!(scroll.offset().y, px(-300.));
+        for _ in 0..3 {
+            sheet.update(cx, |_, cx| cx.notify());
+            draw(cx);
+        }
+        assert_eq!(scroll.offset().y, px(-300.));
+        assert_eq!(scroll.max_offset().y, max);
+    }
 }

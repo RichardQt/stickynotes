@@ -370,7 +370,9 @@ impl Meta {
         let markdown = if body.is_empty() {
             self.title.clone()
         } else if self.title.is_empty() {
-            body.to_string()
+            // The blank line written after the frontmatter is not part of
+            // the note (a note that starts with a picture has no title).
+            body.strip_prefix('\n').unwrap_or(body).to_string()
         } else {
             format!("{}\n{}", self.title, body)
         };
@@ -395,10 +397,16 @@ fn body_without_title(markdown: &str, title: &str) -> String {
         None => (md.as_str(), ""),
     };
     let title = title.trim();
-    if title.is_empty()
-        || first.trim() == title
-        || crate::store::strip_markdown_syntax(first) == title
-    {
+    // A first line that shows a picture is body, never the title line: the
+    // title is plain text, so dropping that line would lose the picture.
+    let is_title_line = if crate::store::has_picture(first) {
+        false
+    } else if title.is_empty() {
+        first.trim().is_empty()
+    } else {
+        first.trim() == title || crate::store::strip_markdown_syntax(first) == title
+    };
+    if is_title_line {
         rest.trim_start_matches('\n').to_string()
     } else {
         md
@@ -1142,6 +1150,36 @@ mod tests {
     #[test]
     fn plain_body_without_frontmatter_is_rejected() {
         assert!(parse_markdown_file("# Hello\nbody").is_none());
+    }
+
+    /// A note that starts with a pasted picture has no title line: the
+    /// picture must reach the server and come back, under the old title
+    /// rules (the alt text, or an empty title) as much as the new one.
+    #[test]
+    fn a_picture_on_the_first_line_is_uploaded_and_comes_back() {
+        let picture = "![图片](data:image/png;base64,iVBORw0KGgo=)";
+        let markdown = format!("{picture}\n截图的说明");
+        for title in ["", "图片"] {
+            let local = SyncNote {
+                title: title.into(),
+                markdown: markdown.clone(),
+                ..note()
+            };
+            let rendered = render_markdown_file(&local);
+            assert!(rendered.contains(picture), "title {title:?}: {rendered}");
+            let (meta, body) = parse_markdown_file(&rendered).unwrap();
+            let remote = meta.into_remote(body);
+            assert!(remote.markdown.contains(picture), "title {title:?}");
+            assert!(remote.markdown.ends_with("截图的说明"));
+        }
+        // An empty title with nothing to drop round-trips exactly.
+        let local = SyncNote {
+            title: String::new(),
+            markdown: markdown.clone(),
+            ..note()
+        };
+        let (meta, body) = parse_markdown_file(&render_markdown_file(&local)).unwrap();
+        assert_eq!(meta.into_remote(body).markdown, markdown);
     }
 
     #[test]

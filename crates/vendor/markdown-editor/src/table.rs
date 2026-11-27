@@ -167,6 +167,22 @@ impl BlockEditorModel {
         Some(out.trim_end().to_string())
     }
 
+    /// The selected cells as tab-separated rows: the plain text other apps
+    /// see, while [`Self::cells_markdown`] travels in the clipboard metadata.
+    pub(crate) fn cells_plain_text(&self) -> Option<String> {
+        let cells = self.selected_cells()?;
+        let rows: Vec<String> = cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| super::serialize::plain_cell(&self.doc, *cell))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect();
+        Some(rows.join("\n"))
+    }
+
     /// Tab / Shift+Tab in a cell: move to the next / previous cell (all of
     /// its text selected, like spreadsheets do). Tab in the last cell adds
     /// a row. Returns `false` when the caret is not in a cell.

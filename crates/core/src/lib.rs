@@ -1,5 +1,6 @@
 pub mod config;
 pub mod markup;
+pub mod picture;
 pub mod shortcuts;
 pub mod store;
 pub mod ticks;

@@ -5,6 +5,41 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/). Design decisions (D1-D22) are in
 [`docs/design.md`](docs/design.md).
 
+## [Unreleased]
+
+### Added
+- `BlockEditorState::apply_paste_markdown(request, markdown, cx)`: a host
+  using `ClipboardPolicy::Host` can resolve a `PasteRequested` with inline
+  Markdown it made itself, for example a pasted picture embedded as
+  `![alt](data:image/png;base64,…)`. Each line becomes a paragraph, as typed;
+  in a table cell the lines are joined with spaces. One undo step. Nothing is
+  inserted, and `false` is returned, for a stale request or a paste position
+  inside a code block.
+- `PasteRequest::is_plain()`, so a host can tell a Cmd/Ctrl+Shift+V paste
+  (text only) from an ordinary one.
+
+### Changed
+- Copy gives other apps plain text: marks and escapes are dropped, images
+  copy as their alt text, headings lose `#`, list items keep a bullet, number
+  or task box, and table cells are tab-separated, one row per line (a line
+  break or tab inside a cell becomes a space). The Markdown travels in the
+  clipboard metadata, so the editor's own paste still restores marks and
+  structure. The tags are now `inline-markdown/v2` and `blocks-markdown/v2`;
+  v1 copies still paste with their marks (D17, D18).
+- Cmd/Ctrl+Shift+V pastes the visible plain text of the editor's own copies,
+  not their Markdown.
+- Host policy: `apply_paste` restores the copy's Markdown only when the host
+  passes the visible text back unchanged; text the host rewrote pastes as
+  external text, and `None` settles the request without inserting anything.
+
+### Fixed
+- Tables under gpui-kit 0.10, which aligns a centred or right-aligned cell's
+  content box instead of painting its text shifted: column boxes come from
+  every cell of the column (and gpui-kit's 48px column minimum), not from the
+  first cell alone, so clicks, hover and grips in such columns hit the cell
+  under the pointer again. The caret in a wrapped centred or right-aligned
+  cell is no longer drawn shifted off its text (`row_shift` removed).
+
 ## [0.2.0] - 2026-11-08
 
 ### Added

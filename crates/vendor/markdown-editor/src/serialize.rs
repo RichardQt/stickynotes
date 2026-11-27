@@ -34,6 +34,22 @@ pub(crate) fn join_blocks(doc: &EditorDocument, ids: &[BlockId]) -> String {
         .join("\n\n")
 }
 
+/// The blocks in `ids` as plain text for the OS clipboard: what other apps
+/// see. Marks are dropped, while structure plain text can carry is kept
+/// (list markers, task boxes, one table row per line with tab-separated
+/// cells). The Markdown that restores the formatting travels separately in
+/// the clipboard metadata, so a paste back into the editor stays lossless.
+pub(crate) fn join_blocks_plain(doc: &EditorDocument, ids: &[BlockId]) -> String {
+    let mut parts = Vec::new();
+    for id in ids {
+        let text = block_plain(doc, *id);
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    parts.join("\n\n")
+}
+
 /// Empty paragraphs are editing boundaries, especially at the end of a draft.
 /// Preserve their separators so restoring then typing cannot join words.
 fn render_children(doc: &EditorDocument, ids: &[BlockId]) -> Vec<(BlockId, String)> {
@@ -241,6 +257,155 @@ fn list_item(doc: &EditorDocument, item: BlockId, marker: &str) -> String {
         }
     }
     out.trim_end_matches('\n').to_string()
+}
+
+/// One block as plain text. The mirror of [`block`] without Markdown syntax:
+/// headings lose their `#`, quotes their `>`, list items keep a bullet or
+/// number, tasks a checkbox, code loses its fence and a table becomes rows of
+/// tab-separated cells.
+fn block_plain(doc: &EditorDocument, id: BlockId) -> String {
+    let Some(entry) = doc.get(id) else {
+        return String::new();
+    };
+    let children = doc.children(id);
+    match (&entry.kind, &entry.content) {
+        (BlockKindData::Root, _) | (BlockKindData::Blockquote, _) => {
+            let mut parts = Vec::new();
+            for child in children {
+                let text = block_plain(doc, *child);
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+            parts.join("\n\n")
+        }
+        (BlockKindData::Paragraph, BlockContent::Inline(inline)) => inline_plain(inline),
+        (BlockKindData::Heading { .. }, BlockContent::Inline(inline)) => {
+            inline_plain(inline).replace('\n', " ")
+        }
+        (BlockKindData::List { ordered, start }, _) => {
+            let mut items = Vec::new();
+            for (ix, item) in children.iter().enumerate() {
+                let checked = match doc.kind(*item) {
+                    Some(BlockKindData::ListItem { checked, .. }) => *checked,
+                    _ => None,
+                };
+                let marker = plain_list_marker(checked, *ordered, *start, ix);
+                items.push(list_item_plain(doc, *item, &marker));
+            }
+            items.join("\n")
+        }
+        (BlockKindData::ListItem { checked, .. }, _) => {
+            list_item_plain(doc, id, &plain_list_marker(*checked, false, None, 0))
+        }
+        (BlockKindData::CodeBlock { .. }, BlockContent::Plain(code)) => code.clone(),
+        (BlockKindData::Table { .. }, _) => children
+            .iter()
+            .map(|row| {
+                doc.children(*row)
+                    .iter()
+                    .map(|cell| plain_cell(doc, *cell))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        // No plain-text form of a rule; a short line keeps the visual break.
+        (BlockKindData::HorizontalRule, _) => "———".to_string(),
+        (BlockKindData::Break { html }, _) => {
+            if *html {
+                "\n".to_string()
+            } else {
+                String::new()
+            }
+        }
+        (BlockKindData::Custom, BlockContent::Atom(AtomData::Custom(node))) => {
+            node.as_text().to_string()
+        }
+        // Definitions have no visible text; Unknown keeps whatever it holds.
+        _ => doc
+            .leaf_text(id)
+            .map(|text| text.replace(super::inline::ATOM_CHAR, ""))
+            .unwrap_or_default(),
+    }
+}
+
+/// One table cell as plain text for a tab-separated row: a soft line break
+/// or a tab inside the cell would start another row or column in a
+/// spreadsheet, so both become spaces.
+pub(crate) fn plain_cell(doc: &EditorDocument, cell: BlockId) -> String {
+    doc.inline(cell)
+        .map(inline_plain)
+        .unwrap_or_default()
+        .replace(['\n', '\t'], " ")
+}
+
+/// A task box replaces the bullet (`[ ] ` / `[x] `); otherwise an ordered
+/// item keeps its number and a bullet item gets `• `.
+fn plain_list_marker(checked: Option<bool>, ordered: bool, start: Option<u32>, ix: usize) -> String {
+    match checked {
+        Some(true) => "[x] ".to_string(),
+        Some(false) => "[ ] ".to_string(),
+        None if ordered => format!("{}. ", start.unwrap_or(1) as usize + ix),
+        None => "• ".to_string(),
+    }
+}
+
+/// One list item as plain text, its marker on the first line and every
+/// continuation line indented by the marker width so nested lists stay
+/// nested.
+fn list_item_plain(doc: &EditorDocument, item: BlockId, marker: &str) -> String {
+    let mut body = String::new();
+    for child in doc.children(item) {
+        let text = block_plain(doc, *child);
+        if text.is_empty() {
+            continue;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&text);
+    }
+    let indent = " ".repeat(marker.chars().count());
+    let mut out = String::new();
+    for (ix, line) in body.split('\n').enumerate() {
+        if ix == 0 {
+            out.push_str(marker);
+            out.push_str(line);
+            continue;
+        }
+        out.push('\n');
+        if !line.is_empty() {
+            out.push_str(&indent);
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Inline text without marks or escapes. An image atom becomes its alt text
+/// (or its URL when the alt is empty), a custom atom its own text.
+pub(crate) fn inline_plain(inline: &InlineText) -> String {
+    let mut out = String::new();
+    for (range, _, atom) in inline.pieces() {
+        match atom {
+            Some(InlineAtom::Image(image)) => {
+                let alt = image.alt.as_deref().unwrap_or_default();
+                if !alt.is_empty() {
+                    out.push_str(alt);
+                    continue;
+                }
+                let url = image.url.to_string();
+                // A data: URL is the image bytes, not readable text.
+                if !url.starts_with("data:") {
+                    out.push_str(&url);
+                }
+            }
+            Some(InlineAtom::Custom(node)) => out.push_str(node.as_text()),
+            None => out.push_str(&inline.text()[range]),
+        }
+    }
+    out
 }
 
 // Inline content goes through `MarkdownSource`, then line starts that

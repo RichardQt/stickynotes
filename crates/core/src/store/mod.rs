@@ -16,7 +16,8 @@ pub mod plum;
 mod preview;
 
 pub use preview::{
-    search_text, snippet_around_match, strip_markdown_syntax, title_and_snippet,
+    has_picture, search_text, snippet_around_match, strip_embedded_pictures,
+    strip_markdown_syntax, title_and_snippet,
 };
 
 use crate::ticks;
